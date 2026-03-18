@@ -24,6 +24,7 @@ export class GameScene extends Phaser.Scene {
     this.checkpointReached = false;
     this.timeRemaining = GAME_CONFIG.timer.stageTimeLimit;
     this.collectibleScore = 0;
+    this.elapsed = 0;             // total elapsed time for speed ramp
   }
 
   create() {
@@ -100,12 +101,11 @@ export class GameScene extends Phaser.Scene {
     this.player.handleInput(left, right, jump);
     this.player.update(dt);
 
-    // --- Speed progression ---
-    const progress = this.cameraZ / this.stageData.totalDistance;
-    this.scrollSpeed = Math.min(
-      GAME_CONFIG.scroll.baseSpeed + Math.floor(progress / GAME_CONFIG.scroll.incrementInterval) * GAME_CONFIG.scroll.speedIncrement,
-      GAME_CONFIG.scroll.maxSpeed
-    );
+    // --- Speed progression (time-based continuous acceleration) ---
+    this.elapsed += dt;
+    const rampT = Math.min(1, this.elapsed / GAME_CONFIG.scroll.rampDuration);
+    this.scrollSpeed = GAME_CONFIG.scroll.baseSpeed +
+      (GAME_CONFIG.scroll.maxSpeed - GAME_CONFIG.scroll.baseSpeed) * rampT;
 
     // --- Advance camera Z ---
     this.cameraZ += this.scrollSpeed * dt;

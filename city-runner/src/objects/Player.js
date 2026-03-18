@@ -34,9 +34,9 @@ export class Player {
     this.shadowGfx = scene.add.graphics();
     this.shadowGfx.setDepth(2.9);
 
-    // Dimensions (screen size at player position)
-    this.drawW = 32;
-    this.drawH = 48;
+    // Dimensions (screen size at player position — running man rear view 48×64)
+    this.drawW = 48;
+    this.drawH = 64;
   }
 
   handleInput(left, right, jump) {

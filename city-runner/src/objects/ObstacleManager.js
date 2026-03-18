@@ -1,17 +1,17 @@
 import { GAME_CONFIG } from '../config/gameConfig.js';
 
 const OBSTACLE_SIZES = {
-  sinkhole: { w: 0.5, h: 0 },    // width as ratio of road, h=0 (flat on ground)
-  car:      { w: 80, h: 44 },
-  barrier:  { w: 52, h: 56 },
-  trashcan: { w: 36, h: 44 },
+  sinkhole:       { w: 0.5, h: 0 },    // width as ratio of road, h=0 (flat on ground)
+  car:            { w: 100, h: 52 },
+  zombie:         { w: 48, h: 56 },
+  zombie_crawler: { w: 44, h: 36 },
 };
 
 const TEXTURE_KEYS = {
   sinkhole: 'sinkhole',
-  car: 'car_rear',
-  barrier: 'barrier',
-  trashcan: 'trashcan',
+  car: 'oncoming_car',
+  zombie: 'zombie',
+  zombie_crawler: 'zombie_crawler',
 };
 
 export class ObstacleManager {
