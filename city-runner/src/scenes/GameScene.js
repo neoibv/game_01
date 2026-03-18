@@ -33,19 +33,25 @@ export class GameScene extends Phaser.Scene {
     // --- City skyline at horizon ---
     this._createSkyline();
 
+    // --- Clouds ---
+    this._createClouds();
+
     // --- Road renderer ---
     this.road = new Road(this);
     this.road.setCurves(this.stageData.curves || []);
-
-    // --- Object graphics layer (above road, for obstacles + collectibles) ---
-    this.objGraphics = this.add.graphics();
-    this.objGraphics.setDepth(2);
 
     // --- Player ---
     this.player = new Player(this, this.road);
 
     // --- Obstacle manager ---
     this.obstacleManager = new ObstacleManager(this, this.road, this.stageData);
+
+    // --- Particle emitters ---
+    this._createParticles();
+
+    // --- Hit flash overlay ---
+    this.hitFlash = this.add.rectangle(W / 2, H / 2, W, H, 0xFF0000, 0);
+    this.hitFlash.setDepth(10);
 
     // --- Input ---
     this.cursors = this.input.keyboard.createCursorKeys();
@@ -134,9 +140,17 @@ export class GameScene extends Phaser.Scene {
 
     // --- Render ---
     this.road.render(this.cameraZ);
-    this.objGraphics.clear();
-    this.obstacleManager.render(this.objGraphics, this.cameraZ);
+    this.obstacleManager.render(this.cameraZ);
     this.player.render();
+
+    // --- Dust particles behind player ---
+    if (this.dustEmitter && !this.player.isJumping && this.player.state !== 'dead') {
+      const proj = this.road.project(this.player.worldX, 0);
+      if (proj) {
+        this.dustEmitter.setPosition(proj.screenX, proj.screenY + 2);
+        this.dustEmitter.emitParticle(1);
+      }
+    }
 
     // --- Update HUD ---
     if (this.uiScene) {
@@ -154,29 +168,44 @@ export class GameScene extends Phaser.Scene {
     if (!result) return;
 
     if (result.type === 'collectible') {
-      // Collected an item
       this.collectibleScore += result.points;
       this._playCoinSFX();
+      // Spark particles at collection point
+      if (this.sparkEmitter && result.screenPos) {
+        this.sparkEmitter.setPosition(result.screenPos.x, result.screenPos.y);
+        this.sparkEmitter.explode(10);
+      }
       return;
     }
 
     // Obstacle hit
     if (result.lethal) {
-      // Sinkhole: instant death
       this.lives = 0;
       if (this.uiScene) this.uiScene.events.emit('update-lives', 0);
       this.player.die();
+      this._flashHit();
       this._gameOver('sinkhole');
     } else {
       this.lives--;
       this.player.hit();
       this._playHitSFX();
+      this._flashHit();
       if (this.uiScene) this.uiScene.events.emit('update-lives', this.lives);
       if (this.lives <= 0) {
         this.player.die();
         this._gameOver('dead');
       }
     }
+  }
+
+  _flashHit() {
+    this.hitFlash.setAlpha(0.35);
+    this.tweens.add({
+      targets: this.hitFlash,
+      alpha: 0,
+      duration: 300,
+      ease: 'Power2',
+    });
   }
 
   _gameOver(reason) {
@@ -234,6 +263,36 @@ export class GameScene extends Phaser.Scene {
     // Lower sky
     sky.fillGradientStyle(0xFDB97D, 0xFDB97D, 0xE8D5B7, 0xE8D5B7, 1);
     sky.fillRect(0, this.scale.height * 0.25, W, this.scale.height * 0.25);
+
+    // Sun
+    const sunGfx = this.add.graphics();
+    sunGfx.setDepth(0);
+    sunGfx.fillStyle(0xFFDD66, 0.3);
+    sunGfx.fillCircle(W * 0.8, H * 0.12, 40);
+    sunGfx.fillStyle(0xFFEE88, 0.5);
+    sunGfx.fillCircle(W * 0.8, H * 0.12, 25);
+    sunGfx.fillStyle(0xFFFF99, 0.8);
+    sunGfx.fillCircle(W * 0.8, H * 0.12, 14);
+  }
+
+  _createClouds() {
+    const cloudGfx = this.add.graphics();
+    cloudGfx.setDepth(0);
+
+    const clouds = [
+      { x: 120, y: 50, w: 100, h: 30 },
+      { x: 400, y: 35, w: 140, h: 35 },
+      { x: 700, y: 55, w: 90, h: 25 },
+      { x: 1000, y: 30, w: 120, h: 32 },
+      { x: 1150, y: 60, w: 80, h: 22 },
+    ];
+
+    for (const c of clouds) {
+      cloudGfx.fillStyle(0xFFFFFF, 0.4);
+      cloudGfx.fillEllipse(c.x, c.y, c.w, c.h);
+      cloudGfx.fillStyle(0xFFFFFF, 0.6);
+      cloudGfx.fillEllipse(c.x - c.w * 0.15, c.y - c.h * 0.1, c.w * 0.6, c.h * 0.7);
+    }
   }
 
   _createSkyline() {
@@ -252,6 +311,17 @@ export class GameScene extends Phaser.Scene {
       const shade = 0x55 + Math.floor(lcg() * 0x33);
       gfx.fillStyle(Phaser.Display.Color.GetColor(shade, shade + 0x10, shade + 0x20));
       gfx.fillRect(x, horizonY - h, w, h);
+
+      // Antenna/spire on tall buildings
+      if (h > 60 && lcg() > 0.4) {
+        const antennaH = 8 + lcg() * 15;
+        gfx.fillStyle(0x888888);
+        gfx.fillRect(x + w / 2 - 1, horizonY - h - antennaH, 2, antennaH);
+        // Antenna light
+        gfx.fillStyle(0xFF3333, 0.8);
+        gfx.fillCircle(x + w / 2, horizonY - h - antennaH, 2);
+      }
+
       // Windows
       gfx.fillStyle(0xFFFF88, 0.4);
       for (let wy = horizonY - h + 5; wy < horizonY - 4; wy += 10) {
@@ -261,6 +331,60 @@ export class GameScene extends Phaser.Scene {
       }
       x += w + 2 + lcg() * 8;
     }
+
+    // Namsan Tower silhouette (Seoul landmark)
+    const towerX = W * 0.35;
+    const towerBaseY = horizonY;
+
+    // Mountain/hill base
+    gfx.fillStyle(0x556655, 0.7);
+    gfx.fillTriangle(
+      towerX - 80, towerBaseY,
+      towerX, towerBaseY - 40,
+      towerX + 80, towerBaseY
+    );
+
+    // Tower shaft
+    gfx.fillStyle(0x999999);
+    gfx.fillRect(towerX - 2, towerBaseY - 90, 4, 50);
+
+    // Tower observation deck
+    gfx.fillStyle(0x888888);
+    gfx.fillRect(towerX - 8, towerBaseY - 95, 16, 10);
+
+    // Tower tip/antenna
+    gfx.fillStyle(0xAAAAAA);
+    gfx.fillRect(towerX - 1, towerBaseY - 110, 2, 15);
+
+    // Tower light
+    gfx.fillStyle(0xFF4444, 0.9);
+    gfx.fillCircle(towerX, towerBaseY - 110, 2);
+  }
+
+  // --- Particles ---
+
+  _createParticles() {
+    // Coin collection sparks
+    this.sparkEmitter = this.add.particles(0, 0, 'particle_spark', {
+      speed: { min: 50, max: 150 },
+      angle: { min: 0, max: 360 },
+      scale: { start: 1, end: 0 },
+      lifespan: 400,
+      gravityY: 100,
+      emitting: false,
+    });
+    this.sparkEmitter.setDepth(5);
+
+    // Dust trail behind player
+    this.dustEmitter = this.add.particles(0, 0, 'particle_dust', {
+      speed: { min: 5, max: 20 },
+      angle: { min: 250, max: 290 },
+      scale: { start: 0.8, end: 0 },
+      alpha: { start: 0.5, end: 0 },
+      lifespan: 300,
+      emitting: false,
+    });
+    this.dustEmitter.setDepth(1.8);
   }
 
   // --- SFX ---

@@ -16,6 +16,8 @@ const CURB_COLOR = 0xCCCCCC;
 const LINE_YELLOW = 0xFFDD00;
 const GRASS_DARK = 0x446644;
 const GRASS_LIGHT = 0x558855;
+const SIDEWALK_COLOR = 0xBBBBAA;
+const CROSSWALK_COLOR = 0xEEEEEE;
 
 export class Road {
   constructor(scene) {
@@ -86,6 +88,12 @@ export class Road {
       gfx.fillStyle(isAlt ? ROAD_DARK : ROAD_LIGHT);
       gfx.fillRect(cx - roadW / 2, screenY, roadW, stripH + 1);
 
+      // Sidewalks (between curb and grass)
+      const sidewalkW = Math.max(3, 20 * s);
+      gfx.fillStyle(isAlt ? SIDEWALK_COLOR : 0xAAAA99);
+      gfx.fillRect(cx - roadW / 2 - sidewalkW, screenY, sidewalkW, stripH + 1);
+      gfx.fillRect(cx + roadW / 2, screenY, sidewalkW, stripH + 1);
+
       // Curb lines (road edges)
       const curbW = Math.max(2, 6 * s);
       if (isAlt) {
@@ -94,12 +102,27 @@ export class Road {
         gfx.fillRect(cx + roadW / 2 - curbW / 2, screenY, curbW, stripH + 1);
       }
 
-      // Center dashed line
+      // Center dashed double yellow line
       const dashSeg = Math.floor(absZ / 3);
       if (dashSeg % 2 === 0) {
-        const lineW = Math.max(2, 8 * s);
+        const lineW = Math.max(1, 3 * s);
+        const gap = Math.max(1, 2 * s);
         gfx.fillStyle(LINE_YELLOW);
-        gfx.fillRect(cx - lineW / 2, screenY, lineW, stripH + 1);
+        gfx.fillRect(cx - gap / 2 - lineW, screenY, lineW, stripH + 1);
+        gfx.fillRect(cx + gap / 2, screenY, lineW, stripH + 1);
+      }
+
+      // Crosswalk segments at specific Z intervals
+      const crosswalkSeg = Math.floor(absZ / 1.5);
+      const crosswalkPattern = Math.floor(absZ) % 200;
+      if (crosswalkPattern >= 0 && crosswalkPattern < 8 && s > 0.05) {
+        const stripeCount = 6;
+        const stripeW = roadW / (stripeCount * 2);
+        gfx.fillStyle(CROSSWALK_COLOR, 0.8);
+        for (let ci = 0; ci < stripeCount; ci++) {
+          const sx2 = cx - roadW / 2 + ci * stripeW * 2 + stripeW * 0.5;
+          gfx.fillRect(sx2, screenY, stripeW, stripH + 1);
+        }
       }
 
       // Fog effect (fade to sky color at distance)

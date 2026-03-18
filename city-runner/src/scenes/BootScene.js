@@ -1,3 +1,5 @@
+import { TextureFactory } from '../objects/TextureFactory.js';
+
 export class BootScene extends Phaser.Scene {
   constructor() {
     super({ key: 'BootScene' });
@@ -29,6 +31,7 @@ export class BootScene extends Phaser.Scene {
   }
 
   create() {
+    TextureFactory.createAll(this);
     this.scene.start('MenuScene');
   }
 }

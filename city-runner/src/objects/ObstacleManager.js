@@ -1,12 +1,5 @@
 import { GAME_CONFIG } from '../config/gameConfig.js';
 
-const OBSTACLE_COLORS = {
-  sinkhole: 0x111111,
-  car: 0xCC2200,
-  barrier: 0xFF6600,
-  trashcan: 0x228844,
-};
-
 const OBSTACLE_SIZES = {
   sinkhole: { w: 0.5, h: 0 },    // width as ratio of road, h=0 (flat on ground)
   car:      { w: 80, h: 44 },
@@ -14,9 +7,11 @@ const OBSTACLE_SIZES = {
   trashcan: { w: 36, h: 44 },
 };
 
-const COLLECTIBLE_COLORS = {
-  coin: 0xFFDD00,
-  food: 0xFF8844,
+const TEXTURE_KEYS = {
+  sinkhole: 'sinkhole',
+  car: 'car_rear',
+  barrier: 'barrier',
+  trashcan: 'trashcan',
 };
 
 export class ObstacleManager {
@@ -33,6 +28,14 @@ export class ObstacleManager {
     this._nextObstacleIdx = 0;
     this._nextCollectibleIdx = 0;
 
+    // Coin animation
+    this._coinFrame = 0;
+    this._coinTimer = 0;
+
+    // Shadow graphics (shared, lightweight)
+    this.shadowGfx = scene.add.graphics();
+    this.shadowGfx.setDepth(1.5);
+
     // Sort stage data by Z
     this.stageData.obstacles.sort((a, b) => a.z - b.z);
     if (this.stageData.collectibles) {
@@ -42,6 +45,13 @@ export class ObstacleManager {
 
   update(dt, cameraZ, scrollSpeed) {
     const lookAhead = GAME_CONFIG.perspective.drawDistance;
+
+    // Coin rotation animation
+    this._coinTimer += dt;
+    if (this._coinTimer >= 0.12) {
+      this._coinTimer = 0;
+      this._coinFrame = (this._coinFrame + 1) % 4;
+    }
 
     // Spawn obstacles that are now within draw distance
     const stageObs = this.stageData.obstacles;
@@ -55,18 +65,28 @@ export class ObstacleManager {
       // Only spawn if still ahead of player
       if (def.z > cameraZ - 10) {
         const roadHalf = this.road.getRoadHalfWidth();
-        const worldX = def.x * roadHalf; // x is normalized -1..1
-        const relZ = def.z - cameraZ;
+        const worldX = def.x * roadHalf;
+        const textureKey = TEXTURE_KEYS[def.type];
+        const image = this.scene.add.image(0, 0, textureKey);
+        image.setDepth(2);
+        image.setVisible(false);
+        // Sinkhole: anchor at center; others: anchor at bottom center
+        if (def.type === 'sinkhole') {
+          image.setOrigin(0.5, 0.5);
+        } else {
+          image.setOrigin(0.5, 1);
+        }
+
         this.obstacles.push({
           type: def.type,
           worldX,
-          worldZ: def.z,       // absolute Z position in stage
+          worldZ: def.z,
           width: def.width || OBSTACLE_SIZES[def.type].w,
           height: OBSTACLE_SIZES[def.type].h,
-          color: OBSTACLE_COLORS[def.type],
           speed: def.speed || 0,
           active: true,
           lethal: def.type === 'sinkhole',
+          image,
         });
       }
     }
@@ -81,14 +101,20 @@ export class ObstacleManager {
       this._nextCollectibleIdx++;
       if (def.z > cameraZ - 10) {
         const roadHalf = this.road.getRoadHalfWidth();
+        const textureKey = def.type === 'food' ? 'food_tteokbokki' : 'coin_1';
+        const image = this.scene.add.image(0, 0, textureKey);
+        image.setDepth(2);
+        image.setOrigin(0.5, 0.5);
+        image.setVisible(false);
+
         this.collectibles.push({
           type: def.type,
           worldX: def.x * roadHalf,
           worldZ: def.z,
-          color: COLLECTIBLE_COLORS[def.type] || 0xFFDD00,
           points: def.type === 'food' ? GAME_CONFIG.score.foodPoints : GAME_CONFIG.score.coinPoints,
           active: true,
           bobPhase: Math.random() * Math.PI * 2,
+          image,
         });
       }
     }
@@ -98,7 +124,6 @@ export class ObstacleManager {
       if (!obs.active) continue;
       if (obs.speed) {
         obs.worldX += obs.speed * scrollSpeed * dt;
-        // Bounce off road edges
         const roadHalf = this.road.getRoadHalfWidth();
         if (Math.abs(obs.worldX) > roadHalf * 0.8) {
           obs.speed = -obs.speed;
@@ -108,10 +133,22 @@ export class ObstacleManager {
 
     // Deactivate obstacles/collectibles that are behind the player
     for (const obs of this.obstacles) {
-      if (obs.worldZ < cameraZ - 20) obs.active = false;
+      if (obs.worldZ < cameraZ - 20) {
+        if (obs.active && obs.image) {
+          obs.image.destroy();
+          obs.image = null;
+        }
+        obs.active = false;
+      }
     }
     for (const col of this.collectibles) {
-      if (col.worldZ < cameraZ - 20) col.active = false;
+      if (col.worldZ < cameraZ - 20) {
+        if (col.active && col.image) {
+          col.image.destroy();
+          col.image = null;
+        }
+        col.active = false;
+      }
     }
 
     // Cleanup old inactive entries periodically
@@ -123,93 +160,97 @@ export class ObstacleManager {
     }
   }
 
-  render(gfx, cameraZ) {
+  render(cameraZ) {
+    this.shadowGfx.clear();
+
     // Collect all renderable objects, sort by Z descending (far first)
     const renderList = [];
 
     for (const obs of this.obstacles) {
       if (!obs.active) continue;
       const relZ = obs.worldZ - cameraZ;
-      if (relZ < -5 || relZ > GAME_CONFIG.perspective.drawDistance) continue;
-      renderList.push({ ...obs, relZ, isCollectible: false });
+      if (relZ < -5 || relZ > GAME_CONFIG.perspective.drawDistance) {
+        if (obs.image) obs.image.setVisible(false);
+        continue;
+      }
+      renderList.push({ obj: obs, relZ, isCollectible: false });
     }
 
     for (const col of this.collectibles) {
       if (!col.active) continue;
       const relZ = col.worldZ - cameraZ;
-      if (relZ < -5 || relZ > GAME_CONFIG.perspective.drawDistance) continue;
-      renderList.push({ ...col, relZ, isCollectible: true });
+      if (relZ < -5 || relZ > GAME_CONFIG.perspective.drawDistance) {
+        if (col.image) col.image.setVisible(false);
+        continue;
+      }
+      renderList.push({ obj: col, relZ, isCollectible: true });
     }
 
     // Sort far-to-near (painter's algorithm)
     renderList.sort((a, b) => b.relZ - a.relZ);
 
     for (const item of renderList) {
-      const proj = this.road.project(item.worldX, item.relZ);
-      if (!proj || proj.scale < 0.01) continue;
+      const proj = this.road.project(item.obj.worldX, item.relZ);
+      if (!proj || proj.scale < 0.01) {
+        if (item.obj.image) item.obj.image.setVisible(false);
+        continue;
+      }
 
       if (item.isCollectible) {
-        this._renderCollectible(gfx, item, proj);
+        this._renderCollectible(item.obj, proj);
       } else {
-        this._renderObstacle(gfx, item, proj);
+        this._renderObstacle(item.obj, proj);
       }
     }
   }
 
-  _renderObstacle(gfx, obs, proj) {
+  _renderObstacle(obs, proj) {
     const s = proj.scale;
+    const img = obs.image;
+    if (!img) return;
 
     if (obs.type === 'sinkhole') {
-      // Sinkhole: dark rectangle on road surface
+      // Sinkhole: scale width based on road proportion
       const roadHalf = this.road.getRoadHalfWidth();
-      const w = (typeof obs.width === 'number' && obs.width <= 1)
-        ? obs.width * roadHalf * 2 * s
-        : obs.width * s;
-      const h = Math.max(4, 20 * s);
-      gfx.fillStyle(obs.color, 0.9);
-      gfx.fillRect(proj.screenX - w / 2, proj.screenY - h / 2, w, h);
-      // Dark edge
-      gfx.fillStyle(0x000000, 0.5);
-      gfx.fillRect(proj.screenX - w / 2, proj.screenY - h / 2, w, Math.max(2, 4 * s));
+      const widthRatio = (typeof obs.width === 'number' && obs.width <= 1) ? obs.width : 0.5;
+      const targetW = widthRatio * roadHalf * 2 * s;
+      const targetH = Math.max(4, 24 * s);
+      img.setDisplaySize(targetW, targetH);
+      img.setPosition(proj.screenX, proj.screenY);
     } else {
-      // Solid obstacle: scaled rectangle
-      const w = obs.width * s;
-      const h = obs.height * s;
+      // Normal obstacle: scale by perspective
+      img.setScale(s);
+      img.setPosition(proj.screenX, proj.screenY);
 
       // Shadow
-      gfx.fillStyle(0x000000, 0.25);
-      gfx.fillEllipse(proj.screenX, proj.screenY + 2, w * 0.8, Math.max(3, 6 * s));
-
-      // Body
-      gfx.fillStyle(obs.color);
-      gfx.fillRect(proj.screenX - w / 2, proj.screenY - h, w, h);
-
-      // Highlight stripe (for car)
-      if (obs.type === 'car') {
-        gfx.fillStyle(0xFFFFFF, 0.3);
-        gfx.fillRect(proj.screenX - w / 2, proj.screenY - h, w, Math.max(2, 4 * s));
-      }
+      const w = (obs.width || 50) * s;
+      this.shadowGfx.fillStyle(0x000000, 0.25);
+      this.shadowGfx.fillEllipse(proj.screenX, proj.screenY + 2, w * 0.8, Math.max(3, 6 * s));
     }
+
+    // Depth sorting: farther objects render behind
+    img.setDepth(2 + (1 - s) * 0.001);
+    img.setVisible(true);
   }
 
-  _renderCollectible(gfx, col, proj) {
+  _renderCollectible(col, proj) {
     const s = proj.scale;
-    const r = Math.max(4, 14 * s);
+    const img = col.image;
+    if (!img) return;
+
     // Bobbing animation
     const bob = Math.sin(col.bobPhase + this.scene.time.now * 0.004) * 8 * s;
     const y = proj.screenY - 30 * s + bob;
 
-    // Glow
-    gfx.fillStyle(col.color, 0.3);
-    gfx.fillCircle(proj.screenX, y, r * 1.5);
+    // Update coin rotation frame
+    if (col.type === 'coin') {
+      img.setTexture(`coin_${this._coinFrame + 1}`);
+    }
 
-    // Body
-    gfx.fillStyle(col.color);
-    gfx.fillCircle(proj.screenX, y, r);
-
-    // Shine
-    gfx.fillStyle(0xFFFFFF, 0.5);
-    gfx.fillCircle(proj.screenX - r * 0.25, y - r * 0.25, r * 0.35);
+    img.setScale(s);
+    img.setPosition(proj.screenX, y);
+    img.setDepth(2 + (1 - s) * 0.001);
+    img.setVisible(true);
   }
 
   checkCollision(player) {
@@ -224,11 +265,18 @@ export class ObstacleManager {
       const relZ = col.worldZ - cameraZ;
       if (Math.abs(relZ) > zThresh * 1.5) continue;
 
-      const roadHalf = this.road.getRoadHalfWidth();
-      const colHalf = 25; // collectible pickup radius in world X
+      const colHalf = 25;
       if (pH.xMax > col.worldX - colHalf && pH.xMin < col.worldX + colHalf) {
+        // Get screen position for particle effect
+        const proj = this.road.project(col.worldX, relZ);
+        const screenPos = proj ? { x: proj.screenX, y: proj.screenY - 30 * proj.scale } : null;
+
+        if (col.image) {
+          col.image.destroy();
+          col.image = null;
+        }
         col.active = false;
-        return { type: 'collectible', points: col.points };
+        return { type: 'collectible', points: col.points, screenPos };
       }
     }
 
@@ -238,7 +286,6 @@ export class ObstacleManager {
       const relZ = obs.worldZ - cameraZ;
       if (Math.abs(relZ) > zThresh) continue;
 
-      // X overlap check
       let obsHalfW;
       if (obs.type === 'sinkhole') {
         const roadHalf = this.road.getRoadHalfWidth();
@@ -254,18 +301,25 @@ export class ObstacleManager {
 
       if (pH.xMax < oxMin || pH.xMin > oxMax) continue;
 
-      // Jump check: if jumping high enough, clear non-sinkhole obstacles
       if (obs.type === 'sinkhole') {
-        // Sinkhole: must jump to avoid
-        if (pH.jumpHeight > jumpSafe) continue; // safely jumping over
+        if (pH.jumpHeight > jumpSafe) continue;
         return { type: 'obstacle', lethal: true, obstacleType: obs.type };
       } else {
-        // Other obstacles: jump over them
         if (pH.jumpHeight > jumpSafe) continue;
         return { type: 'obstacle', lethal: false, obstacleType: obs.type };
       }
     }
 
     return null;
+  }
+
+  destroy() {
+    for (const obs of this.obstacles) {
+      if (obs.image) obs.image.destroy();
+    }
+    for (const col of this.collectibles) {
+      if (col.image) col.image.destroy();
+    }
+    this.shadowGfx.destroy();
   }
 }

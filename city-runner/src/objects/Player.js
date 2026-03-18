@@ -1,12 +1,5 @@
 import { GAME_CONFIG } from '../config/gameConfig.js';
 
-const COLORS = {
-  normal: 0x2255FF,
-  jump:   0x66AAFF,
-  hit:    0xFF2222,
-  dead:   0x888888,
-};
-
 export class Player {
   constructor(scene, road) {
     this.scene = scene;
@@ -26,11 +19,20 @@ export class Player {
     this._invincibleTimer = 0;
     this._blinkTimer = 0;
     this._visible = true;
-    this._color = COLORS.normal;
 
-    // Graphics
-    this.graphics = scene.add.graphics();
-    this.graphics.setDepth(3);
+    // Animation
+    this._runFrame = 0;
+    this._runTimer = 0;
+    this._coinFrame = 0;
+
+    // Sprite image (uses pre-baked textures from TextureFactory)
+    this.sprite = scene.add.image(0, 0, 'player_run_1');
+    this.sprite.setDepth(3);
+    this.sprite.setOrigin(0.5, 1); // anchor at bottom center
+
+    // Shadow graphics (dynamic, changes with jump)
+    this.shadowGfx = scene.add.graphics();
+    this.shadowGfx.setDepth(2.9);
 
     // Dimensions (screen size at player position)
     this.drawW = 32;
@@ -92,16 +94,18 @@ export class Player {
       }
     }
 
-    // Color
+    // Running animation (alternate leg frames)
+    if (this.state === 'running') {
+      this._runTimer += dt;
+      if (this._runTimer >= 0.15) {
+        this._runTimer = 0;
+        this._runFrame = this._runFrame === 0 ? 1 : 0;
+      }
+    }
+
+    // Color state handled by texture selection
     if (this.state === 'hit' && !this.isInvincible) {
       this.state = 'running';
-    }
-    if (this.isJumping) {
-      this._color = COLORS.jump;
-    } else if (this.isInvincible) {
-      this._color = COLORS.hit;
-    } else {
-      this._color = COLORS.normal;
     }
   }
 
@@ -111,48 +115,54 @@ export class Player {
     this._invincibleTimer = GAME_CONFIG.player.invincibleDuration;
     this._blinkTimer = 0;
     this.state = 'hit';
-    this._color = COLORS.hit;
   }
 
   die() {
     this.state = 'dead';
-    this._color = COLORS.dead;
     this._visible = true;
   }
 
   render() {
-    const gfx = this.graphics;
-    gfx.clear();
-    if (!this._visible) return;
+    this.shadowGfx.clear();
+
+    if (!this._visible) {
+      this.sprite.setVisible(false);
+      return;
+    }
 
     // Project player position (Z=0, at player depth)
     const proj = this.road.project(this.worldX, 0);
-    if (!proj) return;
+    if (!proj) {
+      this.sprite.setVisible(false);
+      return;
+    }
 
     const sx = proj.screenX;
     const sy = proj.screenY - this.jumpHeight;
-    const w = this.drawW;
-    const h = this.drawH;
 
-    // Shadow (on ground, always)
-    if (this.jumpHeight > 5) {
-      const shadowW = w * (1 - this.jumpHeight / (GAME_CONFIG.player.jumpHeight * 2));
-      const shadowH = 8 * (1 - this.jumpHeight / (GAME_CONFIG.player.jumpHeight * 2));
-      gfx.fillStyle(0x000000, 0.3);
-      gfx.fillEllipse(sx, proj.screenY + 2, shadowW, shadowH);
+    // Select texture based on state
+    let textureKey;
+    if (this.state === 'dead') {
+      textureKey = 'player_hit';
+    } else if (this.isJumping) {
+      textureKey = 'player_jump';
+    } else if (this.isInvincible) {
+      textureKey = 'player_hit';
+    } else {
+      textureKey = this._runFrame === 0 ? 'player_run_1' : 'player_run_2';
     }
 
-    // Player body
-    gfx.fillStyle(this._color);
-    gfx.fillRect(sx - w / 2, sy - h, w, h);
+    this.sprite.setTexture(textureKey);
+    this.sprite.setPosition(sx, sy);
+    this.sprite.setVisible(true);
 
-    // Eyes (simple)
-    gfx.fillStyle(0xFFFFFF);
-    gfx.fillRect(sx - 6, sy - h + 10, 6, 6);
-    gfx.fillRect(sx + 2, sy - h + 10, 6, 6);
-    gfx.fillStyle(0x000000);
-    gfx.fillRect(sx - 4, sy - h + 12, 3, 3);
-    gfx.fillRect(sx + 4, sy - h + 12, 3, 3);
+    // Shadow (on ground)
+    if (this.jumpHeight > 5) {
+      const shadowW = this.drawW * (1 - this.jumpHeight / (GAME_CONFIG.player.jumpHeight * 2));
+      const shadowH = 8 * (1 - this.jumpHeight / (GAME_CONFIG.player.jumpHeight * 2));
+      this.shadowGfx.fillStyle(0x000000, 0.3);
+      this.shadowGfx.fillEllipse(sx, proj.screenY + 2, shadowW, shadowH);
+    }
   }
 
   getHitbox() {

@@ -47,4 +47,13 @@ export const GAME_CONFIG = {
     zThreshold: 8,         // Z proximity for collision detection
     jumpSafeHeight: 30,    // min jumpHeight to clear obstacles
   },
+
+  // Visual settings for enhanced procedural graphics
+  visual: {
+    playerRunFrameRate: 0.15,  // seconds per run frame
+    coinRotationRate: 0.12,    // seconds per coin rotation frame
+    sparkParticleCount: 10,    // particles on coin collection
+    dustEnabled: true,         // dust trail behind player
+    hitFlashDuration: 300,     // ms for red screen flash on hit
+  },
 };
