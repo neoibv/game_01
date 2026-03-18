@@ -3,6 +3,8 @@
 서울 도심을 질주하는 의사 3D 전방 시점 러너 게임.
 Antarctic Adventure(1983) 스타일의 원근감 있는 도로 위에서 싱크홀, 자동차, 바리케이드를 피하고 아이템을 수집하며 스테이지를 클리어하세요.
 
+**플레이:** https://neoibv.github.io/game_01/
+
 ## 실행 방법
 
 ```bash
@@ -74,7 +76,8 @@ city-runner/
 │   ├── objects/
 │   │   ├── Road.js                # 의사 3D 도로 렌더링 엔진
 │   │   ├── Player.js              # 플레이어
-│   │   └── ObstacleManager.js     # 장애물/수집물 관리 + 충돌
+│   │   ├── ObstacleManager.js     # 장애물/수집물 관리 + 충돌
+│   │   └── TextureFactory.js      # 프로시저럴 텍스처 생성
 │   └── config/
 │       ├── gameConfig.js          # 전역 설정
 │       └── stage1.js              # 스테이지 1 데이터 (Z 기반)
