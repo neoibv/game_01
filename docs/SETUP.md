@@ -18,6 +18,7 @@
 | `YOUTUBE_API_KEY` | 위 2번 키 |
 | `TELEGRAM_BOT_TOKEN` | 위 1번 토큰 |
 | `TELEGRAM_CHAT_ID` | 위 1번 chat id |
+| `ANTHROPIC_API_KEY` | https://console.anthropic.com 에서 발급 (없으면 AI 정리 없이 기본 알림만 감) |
 | `STATE_KEY` | 길고 임의의 문자열 (예: 비밀번호 생성기로 40자). 분실하면 저장된 상태를 복구할 수 없음 |
 
 ## 4. 실행
