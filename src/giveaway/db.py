@@ -20,11 +20,32 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+# 기존 DB에 없는 컬럼은 connect 시 추가한다.
+EXTRA_COLUMNS = {
+    "prize": "TEXT",
+    "prize_value_est": "INTEGER DEFAULT 0",
+    "entry_methods": "TEXT",
+    "requirements": "TEXT",
+    "macro_banned": "INTEGER DEFAULT 0",
+    "auto_enterable": "INTEGER DEFAULT 0",
+    "deadline": "TEXT",
+    "announce_at": "TEXT",
+    "announce_where": "TEXT",
+    "score": "INTEGER DEFAULT 0",
+    "reminded": "INTEGER DEFAULT 0",
+}
+
+
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    for col, decl in EXTRA_COLUMNS.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
+    conn.commit()
     return conn
 
 
@@ -57,3 +78,24 @@ def add_event(conn: sqlite3.Connection, *, source: str, source_url: str, title: 
 def mark_notified(conn: sqlite3.Connection, source_url: str) -> None:
     conn.execute("UPDATE events SET status = 'notified' WHERE source_url = ?", (source_url,))
     conn.commit()
+
+
+UPDATABLE = set(EXTRA_COLUMNS) | {"status"}
+
+
+def update_event(conn: sqlite3.Connection, source_url: str, **fields) -> None:
+    bad = set(fields) - UPDATABLE
+    if bad:
+        raise ValueError(f"updatable 아님: {bad}")
+    if not fields:
+        return
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(f"UPDATE events SET {sets} WHERE source_url = ?", (*fields.values(), source_url))
+    conn.commit()
+
+
+def open_events(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """마감 처리 대상: 알림은 갔고 아직 끝나지 않은 이벤트."""
+    return conn.execute(
+        "SELECT * FROM events WHERE status IN ('notified', 'entered', 'awaiting_approval')"
+    ).fetchall()

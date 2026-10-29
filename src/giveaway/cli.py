@@ -6,9 +6,13 @@ from pathlib import Path
 
 import yaml
 
+import json
+
 from . import db, state, telegram_bot
 from .collectors.youtube import YouTubeClient
 from .detect import detect, load_filters
+from .extract import Extracted, Extractor
+from .rank import parse_deadline, score
 
 ROOT = Path(__file__).resolve().parents[2]
 LOOKBACK_FIRST_RUN_DAYS = 30
@@ -24,6 +28,7 @@ def _iso(dt: datetime) -> str:
 
 
 def format_alert(video, matched: list[str]) -> str:
+    """AI 추출 없이 보내는 기본 알림."""
     snippet = video.pinned_comment or video.description
     return (
         f"🎁 [{video.channel_name}] 이벤트 후보\n{video.title}\n"
@@ -31,11 +36,69 @@ def format_alert(video, matched: list[str]) -> str:
     )
 
 
+METHOD_KO = {"comment": "댓글", "subscribe": "구독", "like": "좋아요", "google_form": "구글폼",
+             "form": "폼", "click": "클릭", "sns_share": "SNS 공유", "other": "기타"}
+
+
+def format_extracted_alert(video, ex: Extracted, sc: int) -> str:
+    lines = [f"🎁 [{video.channel_name}] {video.title}", f"점수 {sc}/100"]
+    if ex.prize:
+        value = f" (약 {ex.prize_value_est:,}원)" if ex.prize_value_est else ""
+        lines.append(f"경품: {ex.prize}{value}")
+    if ex.entry_methods:
+        lines.append("응모: " + " + ".join(METHOD_KO.get(m, m) for m in ex.entry_methods))
+    if ex.comment_prompt:
+        lines.append(f"댓글 주제: {ex.comment_prompt}")
+    if ex.required_keywords:
+        lines.append("필수 문구: " + ", ".join(ex.required_keywords))
+    if ex.form_url:
+        lines.append(f"폼: {ex.form_url}")
+    lines.append(f"마감: {ex.deadline or '미상'}")
+    if ex.announce_at or ex.announce_where:
+        lines.append(f"발표: {ex.announce_at} {ex.announce_where}".strip())
+    if ex.macro_banned:
+        lines.append("⚠️ 매크로/부정 참여 금지 문구 있음 — 직접 응모 권장")
+    if ex.needs_login_or_captcha:
+        lines.append("⚠️ 외부 로그인/본인인증 필요")
+    lines.append(video.url)
+    return "\n".join(lines)
+
+
+def _extract(extractor: Extractor | None, video) -> Extracted | None:
+    """추출 실패 시 None → 기본 알림으로 대체해 이벤트를 놓치지 않는다."""
+    if extractor is None:
+        return None
+    try:
+        return extractor.extract(video.text, title=video.title,
+                                 published_at=video.published_at, today=_now().date().isoformat())
+    except Exception as e:  # noqa: BLE001 — 네트워크/스키마 오류 모두 폴백
+        print(f"extract 실패, 기본 알림으로 대체: {e}", file=sys.stderr)
+        return None
+
+
+def remind_and_expire(conn, notify, now: datetime | None = None) -> dict:
+    """마감 24시간 이내 리마인더 1회, 마감 지난 건 expired 처리."""
+    now = now or _now()
+    out = {"reminded": 0, "expired": 0}
+    for row in db.open_events(conn):
+        dl = parse_deadline(row["deadline"] or "")
+        if not dl:
+            continue
+        if dl < now:
+            db.update_event(conn, row["source_url"], status="expired")
+            out["expired"] += 1
+        elif (dl - now) <= timedelta(hours=24) and not row["reminded"]:
+            notify(f"⏰ 마감 임박 ({row['deadline']})\n{row['title']}\n{row['source_url']}")
+            db.update_event(conn, row["source_url"], reminded=1)
+            out["reminded"] += 1
+    return out
+
+
 def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
-            notify) -> dict:
+            notify, extractor: Extractor | None = None) -> dict:
     last_run = db.get_meta(conn, "last_collect_at")
     published_after = last_run or _iso(_now() - timedelta(days=LOOKBACK_FIRST_RUN_DAYS))
-    stats = {"channels": 0, "videos": 0, "new": 0, "unresolved": []}
+    stats = {"channels": 0, "videos": 0, "new": 0, "skipped": 0, "unresolved": []}
     notified = 0
 
     for ch in channels:
@@ -65,12 +128,33 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
             is_new = db.add_event(conn, source="youtube", source_url=video.url,
                                   title=video.title, host=video.channel_name,
                                   matched=det.matched, raw_text=video.text)
-            if is_new:
-                stats["new"] += 1
-                if notified < MAX_NOTIFY_PER_RUN:
-                    notify(format_alert(video, det.matched))
-                    db.mark_notified(conn, video.url)
-                    notified += 1
+            if not is_new:
+                continue
+            ex = _extract(extractor, video)
+            if ex is not None and (not ex.is_giveaway or ex.is_ended):
+                db.update_event(conn, video.url, status="skipped")
+                stats["skipped"] += 1
+                continue
+            stats["new"] += 1
+            if ex is None:
+                text = format_alert(video, det.matched)
+            else:
+                sc = score(tags=ch.get("tags", []), prize_value_est=ex.prize_value_est,
+                           entry_methods=ex.entry_methods, deadline=ex.deadline, now=_now())
+                db.update_event(
+                    conn, video.url, prize=ex.prize, prize_value_est=ex.prize_value_est,
+                    entry_methods=",".join(ex.entry_methods),
+                    requirements=json.dumps({"keywords": ex.required_keywords,
+                                             "comment_prompt": ex.comment_prompt,
+                                             "form_url": ex.form_url}, ensure_ascii=False),
+                    macro_banned=int(ex.macro_banned), auto_enterable=int(ex.auto_enterable),
+                    deadline=ex.deadline, announce_at=ex.announce_at,
+                    announce_where=ex.announce_where, score=sc)
+                text = format_extracted_alert(video, ex, sc)
+            if notified < MAX_NOTIFY_PER_RUN:
+                notify(text)
+                db.mark_notified(conn, video.url)
+                notified += 1
 
     if stats["unresolved"]:
         notify("⚠️ 채널을 찾지 못함: " + ", ".join(stats["unresolved"]))
@@ -90,9 +174,14 @@ def cmd_collect(args) -> None:
     filters = load_filters(ROOT / "config/filters.yaml")
     token, chat = _env("TELEGRAM_BOT_TOKEN"), _env("TELEGRAM_CHAT_ID")
     conn = db.connect(Path(args.db))
+    notify = lambda text: telegram_bot.send_message(token, chat, text)  # noqa: E731
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    extractor = Extractor(key) if key else None
+    if not extractor:
+        print("ANTHROPIC_API_KEY 없음 → AI 추출 없이 기본 알림", file=sys.stderr)
     stats = collect(conn, YouTubeClient(_env("YOUTUBE_API_KEY")), channels, filters,
-                    lambda text: telegram_bot.send_message(token, chat, text))
-    print(stats)
+                    notify, extractor)
+    print(stats, remind_and_expire(conn, notify))
 
 
 def cmd_state(args) -> None:
