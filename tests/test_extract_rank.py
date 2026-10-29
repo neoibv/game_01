@@ -73,14 +73,15 @@ def test_collect_stores_extracted_fields_and_notifies(tmp_path, respx_mock):
     _mock(respx_mock, description="증정 이벤트")
     conn = db.connect(tmp_path / "t.db")
     sent = []
-    ex = Extracted(is_giveaway=True, prize="SSD", prize_value_est=100000,
-                   entry_methods=["comment"], deadline="2999-01-01")
+    ex = Extracted(is_giveaway=True, prize="SSD", product="삼성 990 PRO", prize_value_est=100000,
+                   entry_methods=["comment"], deadline="2999-01-01", form_url="https://forms.gle/a")
     s = collect(conn, YouTubeClient("k", httpx.Client()), CHANNELS, FILTERS, sent.append,
                 FakeExtractor(ex))
     assert s["new"] == 1
     row = conn.execute("SELECT * FROM events").fetchone()
     assert row["prize"] == "SSD" and row["status"] == "notified" and row["score"] > 0
-    assert any("SSD" in m for m in sent)
+    assert row["product"] == "삼성 990 PRO"
+    assert any("삼성 990 PRO" in m and "이벤트 기한: 2999-01-01" in m for m in sent)
 
 
 @respx.mock(assert_all_called=False)
@@ -96,13 +97,17 @@ def test_collect_skips_non_giveaway_silently(tmp_path, respx_mock):
 
 
 @respx.mock(assert_all_called=False)
-def test_collect_falls_back_when_extract_fails(tmp_path, respx_mock):
+def test_collect_retries_next_run_when_extract_fails(tmp_path, respx_mock):
     _mock(respx_mock, description="증정 이벤트")
     conn = db.connect(tmp_path / "t.db")
     sent = []
-    s = collect(conn, YouTubeClient("k", httpx.Client()), CHANNELS, FILTERS, sent.append,
-                FakeExtractor(error=RuntimeError("boom")))
-    assert s["new"] == 1 and any("이벤트 후보" in m for m in sent)
+    yt = YouTubeClient("k", httpx.Client())
+    s = collect(conn, yt, CHANNELS, FILTERS, sent.append, FakeExtractor(error=RuntimeError("boom")))
+    assert s["errors"] == 1 and not any("v1" in m for m in sent)
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0  # 지워져서 재시도 가능
+    ok = Extracted(is_giveaway=True, form_url="https://forms.gle/a")
+    conn.execute("DELETE FROM meta WHERE key = 'last_collect_at'")
+    assert collect(conn, yt, CHANNELS, FILTERS, sent.append, FakeExtractor(ok))["new"] == 1
 
 
 def test_remind_once_then_expire(tmp_path):

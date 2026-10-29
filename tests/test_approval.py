@@ -192,7 +192,8 @@ def test_collect_proposes_for_comment_events_only(tmp_path, respx_mock):
     _mock(respx_mock, description="증정 이벤트")
     conn = db.connect(tmp_path / "t.db")
     tg = FakeTG()
-    ex = Extracted(is_giveaway=True, entry_methods=["comment"], deadline="2999-01-01")
+    ex = Extracted(is_giveaway=True, entry_methods=["comment"], deadline="2999-01-01",
+                   form_url="https://forms.gle/a")
     collect(conn, YouTubeClient("k", httpx.Client()), CHANNELS, FILTERS, lambda m: None,
             Both(ex), tg)
     row = conn.execute("SELECT * FROM events").fetchone()
