@@ -102,3 +102,20 @@ def test_collect_sites_respects_notify_cap_without_losing_items(tmp_path, monkey
     assert len(sent) == 1
     cli.collect_sites(conn, items, {"include": []}, sent.append, None)  # 다음 실행에서 이어서
     assert len(sent) == 2
+
+
+def test_failed_notification_keeps_item_for_retry(tmp_path):
+    import pytest
+    from giveaway import db
+    from giveaway.cli import collect_sites
+    conn = db.connect(tmp_path / "t.db")
+    item = sites.SiteItem("jupjup", "https://jupjup.app/g/a", "이벤트", prize="x")
+
+    def boom(_):
+        raise RuntimeError("telegram down")
+
+    with pytest.raises(RuntimeError):
+        collect_sites(conn, [item], {"include": []}, boom, None)
+    assert not db.url_exists(conn, item.url)  # 지워져서 다음 실행에 재시도됨
+    sent = []
+    assert collect_sites(conn, [item], {"include": []}, sent.append, None)["new"] == 1

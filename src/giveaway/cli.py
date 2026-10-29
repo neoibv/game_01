@@ -78,6 +78,17 @@ def _extract(extractor: Extractor | None, video) -> Extracted | None:
         return None
 
 
+def _deliver(conn, source_url: str, notify, text: str) -> None:
+    """알림이 실패하면 저장한 이벤트를 지워 다음 실행에서 다시 시도하게 한다(조용히 유실 방지)."""
+    try:
+        notify(text)
+    except Exception:
+        conn.execute("DELETE FROM events WHERE source_url = ?", (source_url,))
+        conn.commit()
+        raise
+    db.mark_notified(conn, source_url)
+
+
 SOURCE_TAGS = {"danawa": ["it"]}  # 다나와 이벤트는 IT/가전 위주
 
 
@@ -136,8 +147,7 @@ def collect_sites(conn, items: list, filters: dict, notify,
                             macro_banned=int(ex.macro_banned), score=sc)
         else:
             db.update_event(conn, item.url, prize=item.prize, deadline=item.deadline)
-        notify(format_site_alert(item, ex, sc))
-        db.mark_notified(conn, item.url)
+        _deliver(conn, item.url, notify, format_site_alert(item, ex, sc))
         notified += 1
         stats["new"] += 1
     return stats
@@ -234,8 +244,7 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 text = format_extracted_alert(video, ex, sc)
             db.update_event(conn, video.url, video_id=video.video_id, channel_id=channel_id)
             if notified < MAX_NOTIFY_PER_RUN:
-                notify(text)
-                db.mark_notified(conn, video.url)
+                _deliver(conn, video.url, notify, text)
                 notified += 1
                 if tg and ex is not None and approval.proposable(ex):
                     approval.propose(conn, tg, extractor, db.event_id_by_url(conn, video.url),
