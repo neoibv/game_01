@@ -1,0 +1,47 @@
+# Events Korea - robots.txt
+# https://events.kr
+
+User-agent: *
+Allow: /
+Disallow: /admin/
+Disallow: /includes/
+Disallow: /config/
+Allow: /uploads/events/
+Disallow: /uploads/
+Disallow: /ajax/
+Disallow: /docs/
+Disallow: /logout.php
+Disallow: /delete_account.php
+Disallow: /verify_email.php
+Disallow: /reset_password.php
+Disallow: /change_password.php
+Disallow: /profile.php
+Disallow: /user_dashboard.php
+Disallow: /my_bookmarks.php
+Disallow: /my_comments.php
+Disallow: /my_events.php
+Disallow: /company_add_event.php
+Disallow: /company_edit_event.php
+Disallow: /company_auth.php
+
+# Googlebot에게는 CSS/JS/이미지 접근 허용 (렌더링 필요)
+User-agent: Googlebot
+Allow: /assets/
+Allow: /uploads/events/
+
+# 과도한 크롤링 봇 속도 제한
+User-agent: AhrefsBot
+Crawl-delay: 10
+
+User-agent: SemrushBot
+Crawl-delay: 10
+
+# 과도한 스크래핑 봇만 차단
+User-agent: Bytespider
+Disallow: /
+
+# AI 검색·학습 크롤러는 위 User-agent:* 규칙을 따라 허용됨 (AEO)
+#   GPTBot(OpenAI 학습), CCBot(Common Crawl), OAI-SearchBot, ClaudeBot,
+#   PerplexityBot, Google-Extended 등 — 공개 영역 인용/학습 허용
+
+Sitemap: https://events.kr/sitemap.xml

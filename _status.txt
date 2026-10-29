@@ -1,0 +1,12 @@
+quasarzone 403 https://quasarzone.com/bbs/qe_event
+quasarzone_robots 403 https://quasarzone.com/robots.txt
+danawa 200 https://event.danawa.com/
+danawa_robots 200 https://event.danawa.com/robots.txt
+jupjup 200 https://jupjup.app/
+jupjup_robots 200 https://jupjup.app/robots.txt
+suto 403 https://www.suto.co.kr/
+suto_robots 403 https://www.suto.co.kr/robots.txt
+eventskr 200 https://events.kr/
+eventskr_robots 200 https://events.kr/robots.txt
+ppomppu 403 https://www.ppomppu.co.kr/zboard/zboard.php?id=event
+ppomppu_robots 200 https://www.ppomppu.co.kr/robots.txt
