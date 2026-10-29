@@ -1,0 +1,23 @@
+from pathlib import Path
+
+import yaml
+
+from .models import Detection
+
+
+def load_filters(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def detect(text: str, filters: dict) -> Detection:
+    lowered = text.lower()
+    matched = [k for k in filters["include"] if k.lower() in lowered]
+    excluded = [k for k in filters.get("exclude", []) if k.lower() in lowered]
+    # 제외어가 있어도 다른 포함어가 남으면 후보로 둔다(종료 안내 영상에 새 이벤트가 같이 있을 수 있음).
+    # 제외어 구문에 포함된 단어만으로 걸린 경우는 후보에서 뺀다.
+    if excluded:
+        stripped = lowered
+        for k in excluded:
+            stripped = stripped.replace(k.lower(), "")
+        matched = [k for k in filters["include"] if k.lower() in stripped]
+    return Detection(matched=matched, excluded=excluded)

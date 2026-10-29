@@ -1,0 +1,12 @@
+# handle을 알면 적고, 비워두면 이름으로 검색해 채널 ID를 한 번 확정한 뒤 DB에 캐시한다.
+channels:
+  - { name: 잇섭,        handle: "@ITSub",   tags: [it] }
+  - { name: 언더케이지,  handle: "@underkg", tags: [it] }
+  - { name: 테크몽,      handle: "",         tags: [it] }
+  - { name: 주연 ZUYONI, handle: "",         tags: [it] }
+  - { name: 디에디트,    handle: "",         tags: [it] }
+  - { name: 가전주부,    handle: "",         tags: [it] }
+  - { name: 뻘짓연구소,  handle: "",         tags: [it] }
+  - { name: 1분미만,     handle: "",         tags: [it] }
+  - { name: 보겸TV,      handle: "",         tags: [entertainment] }
+  - { name: 보겸S,       handle: "",         tags: [entertainment] }
