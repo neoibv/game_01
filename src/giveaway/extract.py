@@ -91,3 +91,35 @@ class Extractor:
             if block.get("type") == "tool_use" and block.get("name") == TOOL_NAME:
                 return Extracted.from_dict(block["input"])
         raise ValueError("tool_use 블록이 응답에 없음")
+
+
+DRAFT_SYSTEM = (
+    "너는 유튜브 이벤트에 응모하는 시청자의 댓글을 대신 써주는 도구다. 한국어로 1~3문장, "
+    "영상 내용과 이벤트 질문에 진짜로 답하는 자연스러운 댓글을 쓴다. 광고처럼 보이거나 "
+    "다른 댓글과 똑같아 보이는 상투구, 과한 이모지는 피한다. 필수 문구가 있으면 그대로 포함한다. "
+    "댓글 본문만 출력한다."
+)
+
+
+def _draft_prompt(video_title: str, description: str, ex: "Extracted") -> str:
+    return (f"영상 제목: {video_title}\n이벤트 댓글 주제: {ex.comment_prompt or '(지정 없음 — 영상 감상 한마디)'}\n"
+            f"필수 문구: {', '.join(ex.required_keywords) or '(없음)'}\n\n영상 설명:\n{description[:2000]}")
+
+
+def _draft_comment(self: "Extractor", video_title: str, description: str, ex: "Extracted") -> str:
+    resp = self.http.post(
+        API_URL,
+        headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
+        json={"model": self.model, "max_tokens": 400, "system": DRAFT_SYSTEM,
+              "messages": [{"role": "user", "content": _draft_prompt(video_title, description, ex)}]},
+    )
+    resp.raise_for_status()
+    text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text").strip()
+    if not text:
+        raise ValueError("빈 댓글 초안")
+    # 모델이 필수 문구를 빠뜨리면 덧붙인다.
+    missing = [k for k in ex.required_keywords if k not in text]
+    return (text + " " + " ".join(missing)).strip() if missing else text
+
+
+Extractor.draft_comment = _draft_comment
