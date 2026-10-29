@@ -156,3 +156,19 @@ def has_entry(conn: sqlite3.Connection, event_id: int, method: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM entries WHERE event_id = ? AND method = ?", (event_id, method)
     ).fetchone() is not None
+
+
+def normalize_title(title: str) -> str:
+    return "".join(ch for ch in title.lower() if ch.isalnum())
+
+
+def title_exists(conn: sqlite3.Connection, title: str) -> bool:
+    """다른 사이트가 같은 이벤트를 중복으로 올린 경우 거르기 위함."""
+    key = normalize_title(title)
+    if not key:
+        return False
+    return any(normalize_title(r["title"]) == key for r in conn.execute("SELECT title FROM events"))
+
+
+def url_exists(conn: sqlite3.Connection, source_url: str) -> bool:
+    return conn.execute("SELECT 1 FROM events WHERE source_url = ?", (source_url,)).fetchone() is not None

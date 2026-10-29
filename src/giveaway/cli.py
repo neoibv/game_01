@@ -9,6 +9,7 @@ import yaml
 import json
 
 from . import approval, auth, db, state
+from .collectors import sites as sites_mod
 from .collectors.youtube import YouTubeClient
 from .detect import detect, load_filters
 from .extract import Extracted, Extractor
@@ -74,6 +75,82 @@ def _extract(extractor: Extractor | None, video) -> Extracted | None:
                                  published_at=video.published_at, today=_now().date().isoformat())
     except Exception as e:  # noqa: BLE001 — 네트워크/스키마 오류 모두 폴백
         print(f"extract 실패, 기본 알림으로 대체: {e}", file=sys.stderr)
+        return None
+
+
+SOURCE_TAGS = {"danawa": ["it"]}  # 다나와 이벤트는 IT/가전 위주
+
+
+def format_site_alert(item, ex: Extracted | None, sc: int | None) -> str:
+    lines = [f"🎁 [{item.source}] {item.title}"]
+    if ex is None:
+        lines += [item.text, item.url]
+        return "\n".join(lines)
+    lines.append(f"점수 {sc}/100")
+    if ex.prize or item.prize:
+        value = f" (약 {ex.prize_value_est:,}원)" if ex.prize_value_est else ""
+        lines.append(f"경품: {ex.prize or item.prize}{value}")
+    if ex.entry_methods:
+        lines.append("응모: " + " + ".join(METHOD_KO.get(m, m) for m in ex.entry_methods))
+    lines.append(f"마감: {ex.deadline or item.deadline or '미상'}")
+    if ex.macro_banned:
+        lines.append("⚠️ 매크로/부정 참여 금지 문구 있음")
+    if ex.needs_login_or_captcha:
+        lines.append("⚠️ 외부 로그인/본인인증 필요 — 직접 응모")
+    lines.append(item.url)
+    return "\n".join(lines)
+
+
+def collect_sites(conn, items: list, filters: dict, notify,
+                  extractor: Extractor | None = None) -> dict:
+    """모음 사이트 항목 처리. 알림 한도에 닿으면 나머지는 저장하지 않고 다음 실행으로 미룬다."""
+    stats = {"seen": len(items), "new": 0, "skipped": 0}
+    notified = 0
+    for item in items:
+        if db.url_exists(conn, item.url) or db.title_exists(conn, item.title):
+            continue
+        if notified >= MAX_NOTIFY_PER_RUN:
+            break
+        ex = _extract_text(extractor, item)
+        # AI가 없으면 키워드/경품 정보가 있는 항목만 후보로 본다
+        if extractor is None and not (item.prize or detect(item.text, filters).is_candidate):
+            db.add_event(conn, source=item.source, source_url=item.url, title=item.title,
+                         host=item.host, matched=[], raw_text=item.text)
+            db.update_event(conn, item.url, status="skipped")
+            stats["skipped"] += 1
+            continue
+        db.add_event(conn, source=item.source, source_url=item.url, title=item.title,
+                     host=item.host, matched=[], raw_text=item.text)
+        if ex is not None and (not ex.is_giveaway or ex.is_ended):
+            db.update_event(conn, item.url, status="skipped")
+            stats["skipped"] += 1
+            continue
+        sc = None
+        if ex is not None:
+            deadline = ex.deadline or item.deadline
+            sc = score(tags=SOURCE_TAGS.get(item.source, []), prize_value_est=ex.prize_value_est,
+                       entry_methods=ex.entry_methods, deadline=deadline, now=_now())
+            db.update_event(conn, item.url, prize=ex.prize or item.prize,
+                            prize_value_est=ex.prize_value_est,
+                            entry_methods=",".join(ex.entry_methods), deadline=deadline,
+                            macro_banned=int(ex.macro_banned), score=sc)
+        else:
+            db.update_event(conn, item.url, prize=item.prize, deadline=item.deadline)
+        notify(format_site_alert(item, ex, sc))
+        db.mark_notified(conn, item.url)
+        notified += 1
+        stats["new"] += 1
+    return stats
+
+
+def _extract_text(extractor: Extractor | None, item) -> Extracted | None:
+    if extractor is None:
+        return None
+    try:
+        return extractor.extract(item.text, title=item.title, published_at="",
+                                 today=_now().date().isoformat())
+    except Exception as e:  # noqa: BLE001
+        print(f"extract 실패({item.url}), 기본 알림으로 대체: {e}", file=sys.stderr)
         return None
 
 
@@ -190,7 +267,15 @@ def cmd_collect(args) -> None:
                     ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN"))
     stats = collect(conn, YouTubeClient(_env("YOUTUBE_API_KEY")), channels, filters,
                     notify, extractor, tg if (extractor and can_enter) else None)
-    print(stats, remind_and_expire(conn, notify))
+    enabled = yaml.safe_load((ROOT / "config/sources.yaml").read_text(encoding="utf-8"))["sites"]
+    items, failed = sites_mod.fetch_all(_now().date(), enabled=enabled)
+    site_stats = collect_sites(conn, items, filters, notify, extractor)
+    prev_failed = db.get_meta(conn, "sites_failed") or ""
+    now_failed = ",".join(failed)
+    if failed and now_failed != prev_failed:  # 같은 실패를 3시간마다 반복 알림하지 않음
+        notify("⚠️ 사이트 수집 실패: " + ", ".join(failed))
+    db.set_meta(conn, "sites_failed", now_failed)
+    print(stats, site_stats, remind_and_expire(conn, notify))
 
 
 def cmd_poll(args) -> None:
