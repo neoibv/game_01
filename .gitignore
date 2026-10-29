@@ -1,7 +1,10 @@
-node_modules/
-dist/
+.env
+*.db
+*.db.enc
+secrets/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
 .DS_Store
 *.log
-.vite/
-.omc/
-.vscode/
