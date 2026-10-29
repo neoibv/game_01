@@ -8,7 +8,7 @@ import yaml
 
 import json
 
-from . import approval, auth, db, state
+from . import approval, auth, db, state, winners
 from .collectors import sites as sites_mod
 from .collectors.youtube import YouTubeClient
 from .detect import detect, load_filters
@@ -159,6 +159,8 @@ def remind_and_expire(conn, notify, now: datetime | None = None) -> dict:
     now = now or _now()
     out = {"reminded": 0, "expired": 0}
     for row in db.open_events(conn):
+        if row["status"] == "entered":  # 응모 완료 건은 winners.check가 관리
+            continue
         dl = parse_deadline(row["deadline"] or "")
         if not dl:
             continue
@@ -275,7 +277,16 @@ def cmd_collect(args) -> None:
     if failed and now_failed != prev_failed:  # 같은 실패를 3시간마다 반복 알림하지 않음
         notify("⚠️ 사이트 수집 실패: " + ", ".join(failed))
     db.set_meta(conn, "sites_failed", now_failed)
-    print(stats, site_stats, remind_and_expire(conn, notify))
+    win = {}
+    if can_enter:
+        from .enter.youtube import YouTubeUser
+        user = YouTubeUser(os.environ["YOUTUBE_CLIENT_ID"], os.environ["YOUTUBE_CLIENT_SECRET"],
+                           os.environ["YOUTUBE_REFRESH_TOKEN"])
+        try:
+            win = winners.check(conn, YouTubeClient(_env("YOUTUBE_API_KEY")), user, notify)
+        except Exception as e:  # noqa: BLE001 — 당첨 확인 실패가 수집을 막지 않게
+            print(f"당첨 확인 실패: {e}", file=sys.stderr)
+    print(stats, site_stats, remind_and_expire(conn, notify), win)
 
 
 def cmd_poll(args) -> None:

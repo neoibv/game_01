@@ -44,3 +44,19 @@ class YouTubeUser:
         resp = self.http.post(f"{API}/videos/rate", params={"id": video_id, "rating": "like"},
                               headers=self._headers())
         resp.raise_for_status()
+
+    def my_channel(self) -> tuple[str, str]:
+        """(채널 ID, @핸들) — 당첨자 발표에서 내 핸들을 찾기 위함."""
+        resp = self.http.get(f"{API}/channels", params={"part": "snippet", "mine": "true"},
+                             headers=self._headers())
+        resp.raise_for_status()
+        item = resp.json()["items"][0]
+        return item["id"], item["snippet"].get("customUrl", "")
+
+    def replies(self, parent_id: str) -> list[dict]:
+        resp = self.http.get(f"{API}/comments", params={
+            "part": "snippet", "parentId": parent_id, "maxResults": 50, "textFormat": "plainText"},
+            headers=self._headers())
+        resp.raise_for_status()
+        return [{"id": i["id"], "author_channel_id": i["snippet"].get("authorChannelId", {}).get("value", ""),
+                 "text": i["snippet"].get("textDisplay", "")} for i in resp.json().get("items", [])]
