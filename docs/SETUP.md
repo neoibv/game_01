@@ -22,7 +22,7 @@
 | `STATE_KEY` | 길고 임의의 문자열 (예: 비밀번호 생성기로 40자). 분실하면 저장된 상태를 복구할 수 없음 |
 
 ## 4. 실행
-Actions 탭 → **collect** → Run workflow. 이후 3시간마다 자동 실행.
+Actions 탭 → **collect** → Run workflow. 이후 매일 08시(KST)쯤 자동 실행.
 첫 실행은 최근 30일 영상을 훑고(최대 20건 알림), 채널 확정 결과를 텔레그램으로 보냄. 채널이 틀렸으면 `config/channels.yaml`에 `handle`을 적어 수정.
 
 ## 5. 댓글 응모 승인 기능 (Phase 3) — YouTube OAuth
