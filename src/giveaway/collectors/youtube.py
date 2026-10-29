@@ -49,15 +49,22 @@ class YouTubeClient:
                                  s.get("description", ""), s["publishedAt"]))
         return out
 
-    def pinned_comment(self, video_id: str, channel_id: str) -> str:
-        """채널 주인이 쓴 댓글 중 상단(relevance) 노출된 것. 댓글이 막힌 영상은 빈 문자열."""
+    def comments(self, video_id: str, channel_id: str) -> tuple[str, list[str]]:
+        """(채널 주인이 쓴 댓글, 그 외 상위 댓글들). 댓글이 막힌 영상은 ("", [])."""
         try:
             data = self._get("commentThreads", part="snippet", videoId=video_id,
-                             order="relevance", maxResults=5, textFormat="plainText")
+                             order="relevance", maxResults=50, textFormat="plainText")
         except httpx.HTTPStatusError:
-            return ""
+            return "", []
+        pinned, others = "", []
         for t in data.get("items", []):
             top = t["snippet"]["topLevelComment"]["snippet"]
-            if top.get("authorChannelId", {}).get("value") == channel_id:
-                return top.get("textDisplay", "")
-        return ""
+            text = top.get("textDisplay", "")
+            if not pinned and top.get("authorChannelId", {}).get("value") == channel_id:
+                pinned = text
+            else:
+                others.append(text)
+        return pinned, others
+
+    def pinned_comment(self, video_id: str, channel_id: str) -> str:
+        return self.comments(video_id, channel_id)[0]

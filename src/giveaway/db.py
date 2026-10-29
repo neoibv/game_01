@@ -47,6 +47,8 @@ EXTRA_COLUMNS = {
     "announce_where": "TEXT",
     "score": "INTEGER DEFAULT 0",
     "reminded": "INTEGER DEFAULT 0",
+    "product": "TEXT",
+    "category": "TEXT",
     "video_id": "TEXT",
     "channel_id": "TEXT",
 }
@@ -172,3 +174,20 @@ def title_exists(conn: sqlite3.Connection, title: str) -> bool:
 
 def url_exists(conn: sqlite3.Connection, source_url: str) -> bool:
     return conn.execute("SELECT 1 FROM events WHERE source_url = ?", (source_url,)).fetchone() is not None
+
+
+def reset_events(conn: sqlite3.Connection) -> int:
+    """알림 기록을 비워 새 형식으로 다시 받아보기 위함. 응모 완료/승인 대기 건은 보존."""
+    cur = conn.execute("DELETE FROM events WHERE status NOT IN ('entered', 'awaiting_approval')")
+    conn.execute("DELETE FROM meta WHERE key = 'last_collect_at'")
+    conn.commit()
+    return cur.rowcount
+
+
+def pending_events(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM events WHERE status = 'pending'").fetchall()
+
+
+def delete_event(conn: sqlite3.Connection, source_url: str) -> None:
+    conn.execute("DELETE FROM events WHERE source_url = ?", (source_url,))
+    conn.commit()

@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "7 */3 * * *"
   workflow_dispatch:
+    inputs:
+      reset_events:
+        description: "이전 알림 기록을 지우고 최근 30일을 새 형식으로 다시 받기"
+        type: boolean
+        default: false
 
 concurrency:
   group: state
@@ -26,7 +31,7 @@ jobs:
       - run: scripts/state_restore.sh
         env:
           STATE_KEY: ${{ secrets.STATE_KEY }}
-      - run: giveaway collect
+      - run: giveaway collect ${{ inputs.reset_events && '--reset-events' || '' }}
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

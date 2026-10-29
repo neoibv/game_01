@@ -20,7 +20,11 @@ SCHEMA = {
         },
         "required_keywords": {"type": "array", "items": {"type": "string"}, "description": "댓글에 반드시 넣어야 하는 문구/해시태그"},
         "comment_prompt": {"type": "string", "description": "댓글로 답해야 하는 질문/주제. 없으면 빈 문자열"},
-        "form_url": {"type": "string", "description": "응모용 폼 URL. 없으면 빈 문자열"},
+        "form_url": {"type": "string", "description": "응모/참여용 링크(구글폼, 이벤트 페이지 등) 중 본문에 실제로 적힌 URL. 영상·채널·SNS 홍보 링크는 제외. 없으면 빈 문자열"},
+        "many_similar_entries": {"type": "boolean", "description": "시청자 댓글 중 여러 개가 같은 양식/문구(질문 답변 형식, 같은 해시태그, '참여합니다' 등)로 달려 있어 실제 응모가 진행 중으로 보이는가. 일반 감상 댓글이 대부분이면 false. 댓글이 주어지지 않았으면 false"},
+        "product": {"type": "string", "description": "경품 제품명(브랜드+모델). 없으면 빈 문자열"},
+        "category": {"enum": ["it", "baby", "gift_travel", "other"],
+                     "description": "경품 분류. it=PC부품·전자기기·가전·스마트기기, baby=아기용품·출산준비용품, gift_travel=기프티콘·상품권·여행·숙박, other=그 외"},
         "deadline": {"type": "string", "description": "응모 마감 YYYY-MM-DD 또는 YYYY-MM-DDTHH:MM. 모르면 빈 문자열"},
         "announce_at": {"type": "string", "description": "당첨 발표일 YYYY-MM-DD. 모르면 빈 문자열"},
         "announce_where": {"type": "string", "description": "당첨 발표 장소(커뮤니티 탭, 고정 댓글 등)"},
@@ -47,6 +51,9 @@ class Extracted:
     required_keywords: list[str] = field(default_factory=list)
     comment_prompt: str = ""
     form_url: str = ""
+    many_similar_entries: bool = False
+    product: str = ""
+    category: str = "other"
     deadline: str = ""
     announce_at: str = ""
     announce_where: str = ""
@@ -57,6 +64,16 @@ class Extracted:
     def from_dict(cls, d: dict) -> "Extracted":
         known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
         return cls(**known)
+
+    @property
+    def is_real_event(self) -> bool:
+        """진행 중인 경품 이벤트이고, 응모 링크가 있거나 시청자들이 같은 양식으로 참여 중일 때만 확정."""
+        return self.is_giveaway and not self.is_ended and (bool(self.form_url) or self.many_similar_entries)
+
+    @property
+    def undecided(self) -> bool:
+        """이벤트처럼 보이지만 아직 응모 링크/참여 댓글 근거가 없음(막 올라온 영상일 수 있음)."""
+        return self.is_giveaway and not self.is_ended and not self.is_real_event
 
     @property
     def auto_enterable(self) -> bool:
@@ -71,7 +88,12 @@ class Extractor:
         self.http = client or httpx.Client(timeout=60)
         self.model = model
 
-    def extract(self, text: str, *, title: str, published_at: str, today: str) -> Extracted:
+    def extract(self, text: str, *, title: str, published_at: str, today: str,
+                comments: list[str] | None = None) -> Extracted:
+        comment_block = ""
+        if comments:
+            lines = "\n".join(f"- {c[:120]}" for c in comments[:40])
+            comment_block = f"\n\n--- 시청자 댓글 상위 {min(len(comments), 40)}개 ---\n{lines}"
         resp = self.http.post(
             API_URL,
             headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
@@ -83,7 +105,7 @@ class Extractor:
                 "tool_choice": {"type": "tool", "name": TOOL_NAME},
                 "messages": [{"role": "user", "content": (
                     f"오늘 날짜: {today}\n영상 제목: {title}\n게시일: {published_at}\n\n"
-                    f"--- 본문 ---\n{text[:6000]}")}],
+                    f"--- 본문 ---\n{text[:6000]}{comment_block}")}],
             },
         )
         resp.raise_for_status()

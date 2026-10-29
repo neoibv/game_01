@@ -77,7 +77,8 @@ def test_collect_sites_dedupes_by_title_and_filters_with_ai(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     sent = []
     s = collect_sites(conn, _items(), {"include": ["추첨"]}, sent.append, _Ex(True))
-    assert s["new"] == 2 and len(sent) == 2  # 같은 제목 1건은 중복으로 제외, 설문은 AI가 True라 통과
+    assert s["new"] == 2 and len(sent) == 1  # 같은 제목 1건은 중복 제외, 2건이 한 메시지로 묶임
+    assert "총 2건" in sent[0]
     sent.clear()
     assert collect_sites(conn, _items(), {"include": ["추첨"]}, sent.append, _Ex(True))["new"] == 0
 

@@ -24,7 +24,7 @@ def _mock(router, *, description, pinned=None):
 
 @respx.mock(assert_all_called=False)
 def test_event_in_description_notifies_once(tmp_path, respx_mock):
-    _mock(respx_mock, description="댓글 이벤트! 추첨 증정")
+    _mock(respx_mock, description="댓글 이벤트! 추첨 증정 https://forms.gle/abc")
     conn = db.connect(tmp_path / "t.db")
     sent = []
     yt = YouTubeClient("k", httpx.Client())
@@ -38,7 +38,7 @@ def test_event_in_description_notifies_once(tmp_path, respx_mock):
 
 @respx.mock(assert_all_called=False)
 def test_event_only_in_pinned_comment(tmp_path, respx_mock):
-    _mock(respx_mock, description="평범한 설명", pinned="구독자 증정 이벤트 진행중")
+    _mock(respx_mock, description="평범한 설명", pinned="구독자 증정 이벤트 진행중 https://forms.gle/xyz")
     conn = db.connect(tmp_path / "t.db")
     s = collect(conn, YouTubeClient("k", httpx.Client()), CHANNELS, FILTERS, lambda m: None)
     assert s["new"] == 1

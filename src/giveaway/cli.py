@@ -1,14 +1,16 @@
 import argparse
 import os
+import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import yaml
-
 import json
 
-from . import approval, auth, db, state, winners
+import yaml
+
+from . import approval, auth, db, digest, state, winners
 from .collectors import sites as sites_mod
 from .collectors.youtube import YouTubeClient
 from .detect import detect, load_filters
@@ -19,6 +21,9 @@ from .telegram_bot import Telegram
 ROOT = Path(__file__).resolve().parents[2]
 LOOKBACK_FIRST_RUN_DAYS = 30
 MAX_NOTIFY_PER_RUN = 20
+PENDING_HOURS = 72  # 응모 근거가 아직 없는 영상을 다시 확인해 주는 기간
+EXTERNAL_LINK = re.compile(r"https?://(?!(?:www\.|m\.)?(?:youtube\.com|youtu\.be))[^\s)]+")
+SOURCE_TAGS = {"danawa": ["it"]}  # 다나와 이벤트는 IT/가전 위주
 
 
 def _now() -> datetime:
@@ -29,128 +34,29 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def format_alert(video, matched: list[str]) -> str:
-    """AI 추출 없이 보내는 기본 알림."""
-    snippet = video.pinned_comment or video.description
-    return (
-        f"🎁 [{video.channel_name}] 이벤트 후보\n{video.title}\n"
-        f"키워드: {', '.join(matched)}\n\n{snippet[:300]}\n\n{video.url}"
-    )
-
-
-METHOD_KO = {"comment": "댓글", "subscribe": "구독", "like": "좋아요", "google_form": "구글폼",
-             "form": "폼", "click": "클릭", "sns_share": "SNS 공유", "other": "기타"}
-
-
-def format_extracted_alert(video, ex: Extracted, sc: int) -> str:
-    lines = [f"🎁 [{video.channel_name}] {video.title}", f"점수 {sc}/100"]
-    if ex.prize:
-        value = f" (약 {ex.prize_value_est:,}원)" if ex.prize_value_est else ""
-        lines.append(f"경품: {ex.prize}{value}")
-    if ex.entry_methods:
-        lines.append("응모: " + " + ".join(METHOD_KO.get(m, m) for m in ex.entry_methods))
-    if ex.comment_prompt:
-        lines.append(f"댓글 주제: {ex.comment_prompt}")
-    if ex.required_keywords:
-        lines.append("필수 문구: " + ", ".join(ex.required_keywords))
-    if ex.form_url:
-        lines.append(f"폼: {ex.form_url}")
-    lines.append(f"마감: {ex.deadline or '미상'}")
-    if ex.announce_at or ex.announce_where:
-        lines.append(f"발표: {ex.announce_at} {ex.announce_where}".strip())
-    if ex.macro_banned:
-        lines.append("⚠️ 매크로/부정 참여 금지 문구 있음 — 직접 응모 권장")
-    if ex.needs_login_or_captcha:
-        lines.append("⚠️ 외부 로그인/본인인증 필요")
-    lines.append(video.url)
-    return "\n".join(lines)
-
-
-def _extract(extractor: Extractor | None, video) -> Extracted | None:
-    """추출 실패 시 None → 기본 알림으로 대체해 이벤트를 놓치지 않는다."""
-    if extractor is None:
-        return None
+def _deliver_batch(conn, urls: list[str], notify, text: str, keep_pending: set[str] = frozenset()) -> None:
+    """묶음 메시지 전송. 실패하면 저장한 이벤트를 되돌려 다음 실행에서 다시 시도한다(조용히 유실 방지)."""
     try:
-        return extractor.extract(video.text, title=video.title,
-                                 published_at=video.published_at, today=_now().date().isoformat())
-    except Exception as e:  # noqa: BLE001 — 네트워크/스키마 오류 모두 폴백
-        print(f"extract 실패, 기본 알림으로 대체: {e}", file=sys.stderr)
-        return None
-
-
-def _deliver(conn, source_url: str, notify, text: str) -> None:
-    """알림이 실패하면 저장한 이벤트를 지워 다음 실행에서 다시 시도하게 한다(조용히 유실 방지)."""
-    try:
-        notify(text)
+        for chunk in digest.split_message(text):
+            notify(chunk)
     except Exception:
-        conn.execute("DELETE FROM events WHERE source_url = ?", (source_url,))
-        conn.commit()
+        for url in urls:
+            if url in keep_pending:
+                db.update_event(conn, url, status="pending")
+            else:
+                db.delete_event(conn, url)
         raise
-    db.mark_notified(conn, source_url)
+    for url in urls:
+        db.mark_notified(conn, url)
 
 
-SOURCE_TAGS = {"danawa": ["it"]}  # 다나와 이벤트는 IT/가전 위주
-
-
-def format_site_alert(item, ex: Extracted | None, sc: int | None) -> str:
-    lines = [f"🎁 [{item.source}] {item.title}"]
+def _decide(ex: Extracted | None, text: str) -> str:
+    """confirmed | pending | skipped. AI가 없으면 외부 응모 링크가 있는 것만 확정."""
     if ex is None:
-        lines += [item.text, item.url]
-        return "\n".join(lines)
-    lines.append(f"점수 {sc}/100")
-    if ex.prize or item.prize:
-        value = f" (약 {ex.prize_value_est:,}원)" if ex.prize_value_est else ""
-        lines.append(f"경품: {ex.prize or item.prize}{value}")
-    if ex.entry_methods:
-        lines.append("응모: " + " + ".join(METHOD_KO.get(m, m) for m in ex.entry_methods))
-    lines.append(f"마감: {ex.deadline or item.deadline or '미상'}")
-    if ex.macro_banned:
-        lines.append("⚠️ 매크로/부정 참여 금지 문구 있음")
-    if ex.needs_login_or_captcha:
-        lines.append("⚠️ 외부 로그인/본인인증 필요 — 직접 응모")
-    lines.append(item.url)
-    return "\n".join(lines)
-
-
-def collect_sites(conn, items: list, filters: dict, notify,
-                  extractor: Extractor | None = None) -> dict:
-    """모음 사이트 항목 처리. 알림 한도에 닿으면 나머지는 저장하지 않고 다음 실행으로 미룬다."""
-    stats = {"seen": len(items), "new": 0, "skipped": 0}
-    notified = 0
-    for item in items:
-        if db.url_exists(conn, item.url) or db.title_exists(conn, item.title):
-            continue
-        if notified >= MAX_NOTIFY_PER_RUN:
-            break
-        ex = _extract_text(extractor, item)
-        # AI가 없으면 키워드/경품 정보가 있는 항목만 후보로 본다
-        if extractor is None and not (item.prize or detect(item.text, filters).is_candidate):
-            db.add_event(conn, source=item.source, source_url=item.url, title=item.title,
-                         host=item.host, matched=[], raw_text=item.text)
-            db.update_event(conn, item.url, status="skipped")
-            stats["skipped"] += 1
-            continue
-        db.add_event(conn, source=item.source, source_url=item.url, title=item.title,
-                     host=item.host, matched=[], raw_text=item.text)
-        if ex is not None and (not ex.is_giveaway or ex.is_ended):
-            db.update_event(conn, item.url, status="skipped")
-            stats["skipped"] += 1
-            continue
-        sc = None
-        if ex is not None:
-            deadline = ex.deadline or item.deadline
-            sc = score(tags=SOURCE_TAGS.get(item.source, []), prize_value_est=ex.prize_value_est,
-                       entry_methods=ex.entry_methods, deadline=deadline, now=_now())
-            db.update_event(conn, item.url, prize=ex.prize or item.prize,
-                            prize_value_est=ex.prize_value_est,
-                            entry_methods=",".join(ex.entry_methods), deadline=deadline,
-                            macro_banned=int(ex.macro_banned), score=sc)
-        else:
-            db.update_event(conn, item.url, prize=item.prize, deadline=item.deadline)
-        _deliver(conn, item.url, notify, format_site_alert(item, ex, sc))
-        notified += 1
-        stats["new"] += 1
-    return stats
+        return "confirmed" if EXTERNAL_LINK.search(text) else "skipped"
+    if ex.is_real_event:
+        return "confirmed"
+    return "pending" if ex.undecided else "skipped"
 
 
 def _extract_text(extractor: Extractor | None, item) -> Extracted | None:
@@ -160,14 +66,56 @@ def _extract_text(extractor: Extractor | None, item) -> Extracted | None:
         return extractor.extract(item.text, title=item.title, published_at="",
                                  today=_now().date().isoformat())
     except Exception as e:  # noqa: BLE001
-        print(f"extract 실패({item.url}), 기본 알림으로 대체: {e}", file=sys.stderr)
+        print(f"extract 실패({item.url}), 키워드 분류로 대체: {e}", file=sys.stderr)
         return None
 
 
+def collect_sites(conn, items: list, filters: dict, notify,
+                  extractor: Extractor | None = None) -> dict:
+    """모음 사이트 항목을 분류(IT > 아기·출산 > 기프티콘·여행·기타)해 한 번에 묶어 보낸다.
+    한도에 닿으면 나머지는 저장하지 않고 다음 실행으로 미룬다."""
+    stats = {"seen": len(items), "new": 0, "skipped": 0}
+    entries: list[digest.SiteEntry] = []
+    for item in items:
+        if db.url_exists(conn, item.url) or db.title_exists(conn, item.title):
+            continue
+        if len(entries) >= MAX_NOTIFY_PER_RUN:
+            break
+        ex = _extract_text(extractor, item)
+        db.add_event(conn, source=item.source, source_url=item.url, title=item.title,
+                     host=item.host, matched=[], raw_text=item.text)
+        # AI가 없으면 키워드/경품 정보가 있는 항목만 후보로 본다
+        no_ai_reject = extractor is None and not (item.prize or detect(item.text, filters).is_candidate)
+        if no_ai_reject or (ex is not None and (not ex.is_giveaway or ex.is_ended)):
+            db.update_event(conn, item.url, status="skipped")
+            stats["skipped"] += 1
+            continue
+        category = ex.category if ex else digest.classify(item.text)
+        if category == "other" and item.source == "danawa":
+            category = "it"
+        deadline = (ex.deadline if ex else "") or item.deadline
+        sc = score(tags=SOURCE_TAGS.get(item.source, []), prize_value_est=ex.prize_value_est if ex else 0,
+                   entry_methods=ex.entry_methods if ex else [], deadline=deadline, now=_now())
+        prize = (ex.prize if ex else "") or item.prize
+        db.update_event(conn, item.url, prize=prize, deadline=deadline, category=category, score=sc,
+                        prize_value_est=ex.prize_value_est if ex else 0,
+                        entry_methods=",".join(ex.entry_methods) if ex else "",
+                        macro_banned=int(bool(ex and ex.macro_banned)))
+        entries.append(digest.SiteEntry(
+            source=item.source, title=item.title, prize=prize, deadline=deadline, url=item.url,
+            category=category, score=sc,
+            manual=bool(ex and (ex.macro_banned or ex.needs_login_or_captcha))))
+        stats["new"] += 1
+    if entries:
+        _deliver_batch(conn, [e.url for e in entries], notify, digest.format_sites(entries))
+    return stats
+
+
 def remind_and_expire(conn, notify, now: datetime | None = None) -> dict:
-    """마감 24시간 이내 리마인더 1회, 마감 지난 건 expired 처리."""
+    """마감 24시간 이내 리마인더(한 메시지로 묶음) 1회, 마감 지난 건 expired 처리."""
     now = now or _now()
     out = {"reminded": 0, "expired": 0}
+    due = []
     for row in db.open_events(conn):
         if row["status"] == "entered":  # 응모 완료 건은 winners.check가 관리
             continue
@@ -178,20 +126,91 @@ def remind_and_expire(conn, notify, now: datetime | None = None) -> dict:
             db.update_event(conn, row["source_url"], status="expired")
             out["expired"] += 1
         elif (dl - now) <= timedelta(hours=24) and not row["reminded"]:
-            notify(f"⏰ 마감 임박 ({row['deadline']})\n{row['title']}\n{row['source_url']}")
+            due.append(row)
+    if due:
+        lines = [f"⏰ 마감 임박 ({len(due)}건)"]
+        for row in due:
+            lines.append(f"• {row['title']} (~{row['deadline']})\n  {row['source_url']}")
+        notify("\n\n".join([lines[0], "\n".join(lines[1:])]))
+        for row in due:
             db.update_event(conn, row["source_url"], reminded=1)
-            out["reminded"] += 1
+        out["reminded"] = len(due)
     return out
+
+
+@dataclass
+class _Confirmed:
+    entry: digest.YtEntry
+    ex: Extracted | None
+    title: str
+    description: str
+    from_pending: bool = False
+
+
+def _confirm(conn, url: str, ex: Extracted | None, *, title: str, channel: str, text: str,
+             tags: list[str], channel_id: str, video_id: str) -> digest.YtEntry:
+    link = ""
+    if ex is None:
+        m = EXTERNAL_LINK.search(text)
+        link = m.group(0) if m else ""
+        entry = digest.YtEntry(channel=channel, title=title, product="", deadline="", url=url,
+                               apply_link=link)
+        db.update_event(conn, url, video_id=video_id, channel_id=channel_id)
+        return entry
+    sc = score(tags=tags, prize_value_est=ex.prize_value_est, entry_methods=ex.entry_methods,
+               deadline=ex.deadline, now=_now())
+    product = ex.product or ex.prize
+    db.update_event(
+        conn, url, prize=ex.prize, product=product, category=ex.category,
+        prize_value_est=ex.prize_value_est, entry_methods=",".join(ex.entry_methods),
+        requirements=json.dumps({"keywords": ex.required_keywords, "comment_prompt": ex.comment_prompt,
+                                 "form_url": ex.form_url}, ensure_ascii=False),
+        macro_banned=int(ex.macro_banned), auto_enterable=int(ex.auto_enterable),
+        deadline=ex.deadline, announce_at=ex.announce_at, announce_where=ex.announce_where,
+        score=sc, video_id=video_id, channel_id=channel_id)
+    return digest.YtEntry(channel=channel, title=title, product=product, deadline=ex.deadline,
+                          url=url, apply_link=ex.form_url, score=sc)
 
 
 def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
             notify, extractor: Extractor | None = None, tg: Telegram | None = None) -> dict:
-    """tg가 있으면 댓글 이벤트에 한해 초안+승인 버튼을 추가로 보낸다."""
+    """유튜브 이벤트를 한 메시지로 묶어 보낸다.
+    확정 기준: 진행 중인 경품 이벤트이면서 (응모 링크가 있거나 여러 시청자가 같은 양식으로 댓글 참여).
+    근거가 아직 없는 영상은 pending으로 두고 PENDING_HOURS 동안 다시 확인한다.
+    tg가 있으면 확정된 댓글 이벤트에 한해 초안+승인 버튼을 추가로 보낸다."""
     last_run = db.get_meta(conn, "last_collect_at")
     published_after = last_run or _iso(_now() - timedelta(days=LOOKBACK_FIRST_RUN_DAYS))
-    stats = {"channels": 0, "videos": 0, "new": 0, "skipped": 0, "unresolved": []}
-    notified = 0
+    stats = {"channels": 0, "videos": 0, "new": 0, "skipped": 0, "pending": 0, "errors": 0,
+             "unresolved": []}
+    confirmed: list[_Confirmed] = []
+    tags_by_name = {c["name"]: c.get("tags", []) for c in channels}
 
+    # 1) 이전에 근거가 부족했던 영상 재확인
+    if extractor:
+        for row in db.pending_events(conn):
+            url = row["source_url"]
+            age = _now() - datetime.strptime(row["first_seen_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            if age > timedelta(hours=PENDING_HOURS) or not row["video_id"]:
+                db.update_event(conn, url, status="skipped")
+                continue
+            try:
+                _, others = yt.comments(row["video_id"], row["channel_id"])
+                ex = extractor.extract(row["raw_text"], title=row["title"], published_at="",
+                                       today=_now().date().isoformat(), comments=others)
+            except Exception as e:  # noqa: BLE001
+                print(f"보류 건 재확인 실패({url}): {e}", file=sys.stderr)
+                continue
+            decision = _decide(ex, row["raw_text"])
+            if decision == "skipped":
+                db.update_event(conn, url, status="skipped")
+            elif decision == "confirmed" and len(confirmed) < MAX_NOTIFY_PER_RUN:
+                entry = _confirm(conn, url, ex, title=row["title"], channel=row["host"],
+                                 text=row["raw_text"], tags=tags_by_name.get(row["host"], []),
+                                 channel_id=row["channel_id"], video_id=row["video_id"])
+                confirmed.append(_Confirmed(entry, ex, row["title"], row["raw_text"], True))
+                stats["new"] += 1
+
+    # 2) 새 영상
     for ch in channels:
         cached = db.get_meta(conn, f"channel:{ch['name']}")
         if cached:
@@ -210,45 +229,60 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
         ids = yt.recent_video_ids(uploads, published_after)
         for video in yt.videos(ids, ch["name"]):
             stats["videos"] += 1
+            if len(confirmed) >= MAX_NOTIFY_PER_RUN:
+                break
             det = detect(video.text, filters)
+            pinned, others = "", []
+            fetched = False
             if not det.is_candidate:
-                video.pinned_comment = yt.pinned_comment(video.video_id, channel_id)
+                pinned, others = yt.comments(video.video_id, channel_id)
+                fetched = True
+                video.pinned_comment = pinned
                 det = detect(video.text, filters)
             if not det.is_candidate:
                 continue
-            is_new = db.add_event(conn, source="youtube", source_url=video.url,
-                                  title=video.title, host=video.channel_name,
-                                  matched=det.matched, raw_text=video.text)
-            if not is_new:
+            if db.url_exists(conn, video.url):
                 continue
-            ex = _extract(extractor, video)
-            if ex is not None and (not ex.is_giveaway or ex.is_ended):
+            if not fetched:
+                pinned, others = yt.comments(video.video_id, channel_id)
+                video.pinned_comment = pinned
+            db.add_event(conn, source="youtube", source_url=video.url, title=video.title,
+                         host=video.channel_name, matched=det.matched, raw_text=video.text)
+            db.update_event(conn, video.url, video_id=video.video_id, channel_id=channel_id)
+            ex = None
+            if extractor:
+                try:
+                    ex = extractor.extract(video.text, title=video.title, published_at=video.published_at,
+                                           today=_now().date().isoformat(), comments=others)
+                except Exception as e:  # noqa: BLE001 — 지우고 다음 실행에서 재시도
+                    print(f"extract 실패({video.url}), 다음 실행에서 재시도: {e}", file=sys.stderr)
+                    db.delete_event(conn, video.url)
+                    stats["errors"] += 1
+                    continue
+            decision = _decide(ex, video.text)
+            if decision == "skipped":
                 db.update_event(conn, video.url, status="skipped")
                 stats["skipped"] += 1
-                continue
-            stats["new"] += 1
-            if ex is None:
-                text = format_alert(video, det.matched)
+            elif decision == "pending":
+                db.update_event(conn, video.url, status="pending")
+                stats["pending"] += 1
             else:
-                sc = score(tags=ch.get("tags", []), prize_value_est=ex.prize_value_est,
-                           entry_methods=ex.entry_methods, deadline=ex.deadline, now=_now())
-                db.update_event(
-                    conn, video.url, prize=ex.prize, prize_value_est=ex.prize_value_est,
-                    entry_methods=",".join(ex.entry_methods),
-                    requirements=json.dumps({"keywords": ex.required_keywords,
-                                             "comment_prompt": ex.comment_prompt,
-                                             "form_url": ex.form_url}, ensure_ascii=False),
-                    macro_banned=int(ex.macro_banned), auto_enterable=int(ex.auto_enterable),
-                    deadline=ex.deadline, announce_at=ex.announce_at,
-                    announce_where=ex.announce_where, score=sc)
-                text = format_extracted_alert(video, ex, sc)
-            db.update_event(conn, video.url, video_id=video.video_id, channel_id=channel_id)
-            if notified < MAX_NOTIFY_PER_RUN:
-                _deliver(conn, video.url, notify, text)
-                notified += 1
-                if tg and ex is not None and approval.proposable(ex):
-                    approval.propose(conn, tg, extractor, db.event_id_by_url(conn, video.url),
-                                     video.title, video.description, ex)
+                entry = _confirm(conn, video.url, ex, title=video.title, channel=video.channel_name,
+                                 text=video.text, tags=ch.get("tags", []), channel_id=channel_id,
+                                 video_id=video.video_id)
+                confirmed.append(_Confirmed(entry, ex, video.title, video.description))
+                stats["new"] += 1
+
+    # 3) 묶음 전송 후 승인 요청
+    if confirmed:
+        _deliver_batch(conn, [c.entry.url for c in confirmed], notify,
+                       digest.format_youtube([c.entry for c in confirmed]),
+                       keep_pending={c.entry.url for c in confirmed if c.from_pending})
+        if tg and extractor:
+            for c in confirmed:
+                if c.ex is not None and approval.proposable(c.ex):
+                    approval.propose(conn, tg, extractor, db.event_id_by_url(conn, c.entry.url),
+                                     c.title, c.description, c.ex)
 
     if stats["unresolved"]:
         notify("⚠️ 채널을 찾지 못함: " + ", ".join(stats["unresolved"]))
@@ -268,6 +302,8 @@ def cmd_collect(args) -> None:
     filters = load_filters(ROOT / "config/filters.yaml")
     token, chat = _env("TELEGRAM_BOT_TOKEN"), _env("TELEGRAM_CHAT_ID")
     conn = db.connect(Path(args.db))
+    if args.reset_events:
+        print("알림 기록 초기화:", db.reset_events(conn), "건 삭제")
     tg = Telegram(token, chat)
     notify = tg.send
     key = os.environ.get("ANTHROPIC_API_KEY")
@@ -323,6 +359,8 @@ def main() -> None:
     sub = p.add_subparsers(required=True)
     c = sub.add_parser("collect")
     c.add_argument("--db", default="data/giveaways.db")
+    c.add_argument("--reset-events", action="store_true",
+                   help="이전 알림 기록을 지우고 최근 30일을 새 형식으로 다시 받는다")
     c.set_defaults(func=cmd_collect)
     pl = sub.add_parser("poll")
     pl.add_argument("--db", default="data/giveaways.db")
