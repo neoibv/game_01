@@ -8,11 +8,12 @@ import yaml
 
 import json
 
-from . import db, state, telegram_bot
+from . import approval, auth, db, state
 from .collectors.youtube import YouTubeClient
 from .detect import detect, load_filters
 from .extract import Extracted, Extractor
 from .rank import parse_deadline, score
+from .telegram_bot import Telegram
 
 ROOT = Path(__file__).resolve().parents[2]
 LOOKBACK_FIRST_RUN_DAYS = 30
@@ -95,7 +96,8 @@ def remind_and_expire(conn, notify, now: datetime | None = None) -> dict:
 
 
 def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
-            notify, extractor: Extractor | None = None) -> dict:
+            notify, extractor: Extractor | None = None, tg: Telegram | None = None) -> dict:
+    """tg가 있으면 댓글 이벤트에 한해 초안+승인 버튼을 추가로 보낸다."""
     last_run = db.get_meta(conn, "last_collect_at")
     published_after = last_run or _iso(_now() - timedelta(days=LOOKBACK_FIRST_RUN_DAYS))
     stats = {"channels": 0, "videos": 0, "new": 0, "skipped": 0, "unresolved": []}
@@ -151,10 +153,14 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                     deadline=ex.deadline, announce_at=ex.announce_at,
                     announce_where=ex.announce_where, score=sc)
                 text = format_extracted_alert(video, ex, sc)
+            db.update_event(conn, video.url, video_id=video.video_id, channel_id=channel_id)
             if notified < MAX_NOTIFY_PER_RUN:
                 notify(text)
                 db.mark_notified(conn, video.url)
                 notified += 1
+                if tg and ex is not None and approval.proposable(ex):
+                    approval.propose(conn, tg, extractor, db.event_id_by_url(conn, video.url),
+                                     video.title, video.description, ex)
 
     if stats["unresolved"]:
         notify("⚠️ 채널을 찾지 못함: " + ", ".join(stats["unresolved"]))
@@ -174,14 +180,31 @@ def cmd_collect(args) -> None:
     filters = load_filters(ROOT / "config/filters.yaml")
     token, chat = _env("TELEGRAM_BOT_TOKEN"), _env("TELEGRAM_CHAT_ID")
     conn = db.connect(Path(args.db))
-    notify = lambda text: telegram_bot.send_message(token, chat, text)  # noqa: E731
+    tg = Telegram(token, chat)
+    notify = tg.send
     key = os.environ.get("ANTHROPIC_API_KEY")
     extractor = Extractor(key) if key else None
     if not extractor:
         print("ANTHROPIC_API_KEY 없음 → AI 추출 없이 기본 알림", file=sys.stderr)
+    can_enter = all(os.environ.get(k) for k in
+                    ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN"))
     stats = collect(conn, YouTubeClient(_env("YOUTUBE_API_KEY")), channels, filters,
-                    notify, extractor)
+                    notify, extractor, tg if (extractor and can_enter) else None)
     print(stats, remind_and_expire(conn, notify))
+
+
+def cmd_poll(args) -> None:
+    from .enter.youtube import YouTubeUser
+    tg = Telegram(_env("TELEGRAM_BOT_TOKEN"), _env("TELEGRAM_CHAT_ID"))
+    conn = db.connect(Path(args.db))
+    user = YouTubeUser(_env("YOUTUBE_CLIENT_ID"), _env("YOUTUBE_CLIENT_SECRET"),
+                       _env("YOUTUBE_REFRESH_TOKEN"))
+    print("처리한 업데이트:", approval.poll(conn, tg, user))
+
+
+def cmd_auth(args) -> None:
+    token = auth.run(_env("YOUTUBE_CLIENT_ID"), _env("YOUTUBE_CLIENT_SECRET"))
+    print("\nYOUTUBE_REFRESH_TOKEN 값 (GitHub Secrets에 등록, 타인에게 공유 금지):\n" + token)
 
 
 def cmd_state(args) -> None:
@@ -196,6 +219,10 @@ def main() -> None:
     c = sub.add_parser("collect")
     c.add_argument("--db", default="data/giveaways.db")
     c.set_defaults(func=cmd_collect)
+    pl = sub.add_parser("poll")
+    pl.add_argument("--db", default="data/giveaways.db")
+    pl.set_defaults(func=cmd_poll)
+    sub.add_parser("auth").set_defaults(func=cmd_auth)
     s = sub.add_parser("state")
     s.add_argument("action", choices=["encrypt", "decrypt"])
     s.add_argument("src")

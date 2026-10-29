@@ -13,6 +13,20 @@ CREATE TABLE IF NOT EXISTS events (
     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     status TEXT NOT NULL DEFAULT 'new'
 );
+CREATE TABLE IF NOT EXISTS drafts (
+    event_id INTEGER PRIMARY KEY,
+    text TEXT NOT NULL,
+    message_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS entries (
+    id INTEGER PRIMARY KEY,
+    event_id INTEGER NOT NULL,
+    method TEXT NOT NULL,
+    payload TEXT,
+    entered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    result TEXT NOT NULL DEFAULT 'pending',
+    UNIQUE(event_id, method)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -33,6 +47,8 @@ EXTRA_COLUMNS = {
     "announce_where": "TEXT",
     "score": "INTEGER DEFAULT 0",
     "reminded": "INTEGER DEFAULT 0",
+    "video_id": "TEXT",
+    "channel_id": "TEXT",
 }
 
 
@@ -99,3 +115,44 @@ def open_events(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM events WHERE status IN ('notified', 'entered', 'awaiting_approval')"
     ).fetchall()
+
+
+def get_event(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+
+
+def event_id_by_url(conn: sqlite3.Connection, source_url: str) -> int:
+    return conn.execute("SELECT id FROM events WHERE source_url = ?", (source_url,)).fetchone()["id"]
+
+
+def set_draft(conn: sqlite3.Connection, event_id: int, text: str, message_id: int | None) -> None:
+    conn.execute(
+        "INSERT INTO drafts(event_id, text, message_id) VALUES(?, ?, ?) "
+        "ON CONFLICT(event_id) DO UPDATE SET text = excluded.text, message_id = excluded.message_id",
+        (event_id, text, message_id),
+    )
+    conn.commit()
+
+
+def get_draft(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM drafts WHERE event_id = ?", (event_id,)).fetchone()
+
+
+def event_id_by_draft_message(conn: sqlite3.Connection, message_id: int) -> int | None:
+    row = conn.execute("SELECT event_id FROM drafts WHERE message_id = ?", (message_id,)).fetchone()
+    return row["event_id"] if row else None
+
+
+def add_entry(conn: sqlite3.Connection, event_id: int, method: str, payload: str) -> bool:
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO entries(event_id, method, payload) VALUES(?, ?, ?)",
+        (event_id, method, payload),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def has_entry(conn: sqlite3.Connection, event_id: int, method: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM entries WHERE event_id = ? AND method = ?", (event_id, method)
+    ).fetchone() is not None
