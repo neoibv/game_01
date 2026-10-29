@@ -3,6 +3,9 @@ name: sample-sites
 # 수집기 개발용: 이벤트 사이트 목록 페이지를 받아 samples 브랜치에 저장한다(파서 픽스처).
 on:
   workflow_dispatch:
+  push:
+    branches: [claude/confident-ptolemy-leaeu8]
+    paths: [.github/workflows/sample-sites.yml]
 
 permissions:
   contents: write
