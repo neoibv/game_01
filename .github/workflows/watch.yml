@@ -1,0 +1,38 @@
+name: watch
+
+# 텔레그램 버튼/답장 대기 감시. GitHub의 예약 실행(schedule)은 몇 시간씩 늦어지므로,
+# 초안·양식 요청을 보낸 뒤 몇 시간 동안만 이 작업이 텔레그램을 롱폴링하다가
+# 클릭/답장이 오면 곧바로 poll 워크플로를 깨운다(보통 30~60초 안에 처리).
+# collect/poll이 필요할 때 자동으로 켠다. DB를 건드리지 않아 다른 작업과 충돌하지 않는다.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "감시할 시간(분)"
+        default: "180"
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e .
+      - run: giveaway watch --minutes "${{ inputs.minutes }}"
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
