@@ -16,7 +16,25 @@ SCHEMA = {
         "prize_value_est": {"type": "integer", "description": "경품 총 추정 가치(원). 모르면 0"},
         "entry_methods": {
             "type": "array",
+            "description": "응모를 위해 해야 하는 모든 행동을 빠짐없이(예: 구독+좋아요+댓글+구글폼이면 네 개 모두). 댓글을 달아야 하면 반드시 comment 포함",
             "items": {"type": "string", "enum": ["comment", "subscribe", "like", "google_form", "form", "click", "sns_share", "other"]},
+        },
+        "entry_steps": {
+            "type": "array", "items": {"type": "string"},
+            "description": "응모 절차를 순서대로 한 줄씩(예: '채널 구독', '좋아요', '댓글: 영상 보고 느낀 점', '구글폼 작성'). 최대 6개",
+        },
+        "requires_purchase_or_signup": {
+            "type": "boolean",
+            "description": "응모에 외부 서비스 회원가입, 상품 구매, 앱 설치, 통신사 가입·개통, 유료 결제 같은 조건이 있는가. 채널 구독·좋아요·댓글·구글폼 작성은 해당 없음",
+        },
+        "signup_condition": {"type": "string", "description": "위 조건의 내용 한 줄. 없으면 빈 문자열"},
+        "entry_format": {
+            "type": "string",
+            "description": "댓글/응모 양식 요약(예: '보겸으로 3행시', '사연 + 참여합니다'). 본문에 명시되어 있거나, 영상에서 안내하는 채널이면 시청자 댓글의 공통 양식에서 추정. 모르면 빈 문자열",
+        },
+        "format_confidence": {
+            "type": "string", "enum": ["high", "low", "none"],
+            "description": "entry_format의 확실성. high=본문에 명시, low=시청자 댓글 패턴에서 추정, none=알 수 없음",
         },
         "required_keywords": {"type": "array", "items": {"type": "string"}, "description": "댓글에 반드시 넣어야 하는 문구/해시태그"},
         "comment_prompt": {"type": "string", "description": "댓글로 답해야 하는 질문/주제. 없으면 빈 문자열"},
@@ -36,7 +54,8 @@ SCHEMA = {
 
 SYSTEM = (
     "너는 한국 유튜브 영상 설명란/고정 댓글, 또는 이벤트 모음 사이트 목록 항목에서 경품 이벤트 정보를 추출하는 도구다. "
-    "텍스트에 없는 내용을 추측하지 말고, 모르면 빈 값으로 둔다. 영상 속 협찬 제품 소개나 "
+    "텍스트에 없는 내용을 추측하지 말고, 모르면 빈 값으로 둔다. 응모에 필요한 행동(구독·좋아요·댓글·폼 제출 등)은 "
+    "하나도 빠뜨리지 않고 entry_methods와 entry_steps에 적는다. 마감일이 오늘 날짜보다 이전이면 is_ended=true다. 영상 속 협찬 제품 소개나 "
     "단순 구독 요청, 공모전·설문조사·체험단 모집만 있는 글은 경품 이벤트가 아니다(경품 추첨이 함께 명시된 경우만 해당). 반드시 record_giveaway 도구로만 답한다."
 )
 
@@ -51,6 +70,11 @@ class Extracted:
     required_keywords: list[str] = field(default_factory=list)
     comment_prompt: str = ""
     form_url: str = ""
+    entry_steps: list[str] = field(default_factory=list)
+    requires_purchase_or_signup: bool = False
+    signup_condition: str = ""
+    entry_format: str = ""
+    format_confidence: str = "none"
     many_similar_entries: bool = False
     product: str = ""
     category: str = "other"
@@ -101,11 +125,17 @@ class Extractor:
         return resp.json()
 
     def extract(self, text: str, *, title: str, published_at: str, today: str,
-                comments: list[str] | None = None) -> Extracted:
+                comments: list[str] | None = None, format_in_video: bool = False) -> Extracted:
         comment_block = ""
+        if format_in_video:
+            comment_block += (
+                "\n\n[채널 특성] 이 채널은 응모 방법을 영상 말미(음성)에서 영상마다 다르게 안내하고, 그 내용은 설명란에 "
+                "없는 경우가 많다. 설명/고정댓글에 '영상에서 말씀드리는 응모양식' 같은 문구가 있거나 다수의 시청자 댓글이 "
+                "같은 양식(예: '보겸으로 N행시', '사연+참여합니다')을 따르면 진행 중인 이벤트로 본다. 그 경우 댓글들의 공통 "
+                "양식을 entry_format에 요약하고 format_confidence는 low로 한다. 일반 감상·응원 댓글뿐이면 이벤트가 아니다.")
         if comments:
-            lines = "\n".join(f"- {c[:120]}" for c in comments[:40])
-            comment_block = f"\n\n--- 시청자 댓글 상위 {min(len(comments), 40)}개 ---\n{lines}"
+            lines = "\n".join(f"- {c[:160]}" for c in comments[:40])
+            comment_block += f"\n\n--- 시청자 댓글 {min(len(comments), 40)}개 ---\n{lines}"
         data = self._post({
             "model": self.model,
             "max_tokens": 1024,
@@ -132,6 +162,7 @@ DRAFT_SYSTEM = (
 
 def _draft_prompt(video_title: str, description: str, ex: "Extracted") -> str:
     return (f"영상 제목: {video_title}\n이벤트 댓글 주제: {ex.comment_prompt or '(지정 없음 — 영상 감상 한마디)'}\n"
+            f"댓글 양식: {ex.entry_format or '(지정 없음)'}\n"
             f"필수 문구: {', '.join(ex.required_keywords) or '(없음)'}\n\n영상 설명:\n{description[:2000]}")
 
 

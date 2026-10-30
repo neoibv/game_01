@@ -10,16 +10,34 @@ from .rank import parse_deadline
 
 
 def proposable(ex: Extracted) -> bool:
-    return "comment" in ex.entry_methods and not ex.macro_banned and not ex.needs_login_or_captcha
+    """댓글이 응모 조건에 들어 있으면 초안을 만든다(폼 제출 등 다른 조건이 함께 있어도)."""
+    return "comment" in ex.entry_methods
 
 
 def _buttons(event_id: int) -> list[tuple[str, str]]:
     return [("✅ 게시", f"post:{event_id}"), ("⏭ 건너뛰기", f"skip:{event_id}")]
 
 
-def _draft_message(title: str, text: str) -> str:
-    return (f"✍️ 댓글 초안 — {title}\n\n{text}\n\n"
-            "수정하려면 이 메시지에 답장(reply)으로 새 댓글을 보내세요.")
+def _notes(ex: Extracted) -> str:
+    """초안과 함께 보여줄 주의사항: 직접 해야 할 남은 단계, 양식 추정 경고."""
+    lines = []
+    if ex.format_confidence == "low":
+        lines.append("⚠️ 응모양식은 시청자 댓글 패턴으로 추정한 것입니다. 영상 마지막의 안내를 확인하고 양식이 다르면 "
+                     "[게시] 대신 답장으로 고쳐 쓰세요(양식이 틀리면 당첨이 취소될 수 있음).")
+    manual = [m for m in ex.entry_methods if m in ("google_form", "form", "sns_share", "other")]
+    if manual:
+        lines.append("📝 댓글 외에 직접 해야 할 것: " + (" → ".join(ex.entry_steps) if ex.entry_steps else ", ".join(manual))
+                     + (f"\n   {ex.form_url}" if ex.form_url else ""))
+    if ex.macro_banned:
+        lines.append("🚫 자동 응모 금지 문구가 있어 [게시] 버튼을 달지 않았습니다. 위 내용을 복사해 직접 작성하세요.")
+    if {"subscribe", "like"} & set(ex.entry_methods) and not ex.macro_banned:
+        lines.append("ℹ️ [게시]를 누르면 구독·좋아요도 함께 처리됩니다.")
+    return "\n".join(lines)
+
+
+def _draft_message(title: str, text: str, notes: str = "", can_post: bool = True) -> str:
+    tail = "수정하려면 이 메시지에 답장(reply)으로 새 댓글을 보내세요." if can_post else ""
+    return "\n\n".join(p for p in (f"✍️ 댓글 초안 — {title}", text, notes, tail) if p)
 
 
 def propose(conn, tg, extractor: Extractor, event_id: int, title: str, description: str,
@@ -29,8 +47,13 @@ def propose(conn, tg, extractor: Extractor, event_id: int, title: str, descripti
         text = extractor.draft_comment(title, description, ex)
     except Exception:  # noqa: BLE001
         return False
-    msg_id = tg.send(_draft_message(title, text), buttons=_buttons(event_id))
+    notes = _notes(ex)
+    if ex.macro_banned:  # 자동 게시하지 않고 초안만 보낸다
+        tg.send(_draft_message(title, text, notes, can_post=False))
+        return True
+    msg_id = tg.send(_draft_message(title, text, notes), buttons=_buttons(event_id))
     db.set_draft(conn, event_id, text, msg_id)
+    db.set_meta(conn, f"draft_notes:{event_id}", notes)
     row = db.get_event(conn, event_id)
     db.update_event(conn, row["source_url"], status="awaiting_approval")
     return True
@@ -124,7 +147,8 @@ def handle_update(conn, tg, yt_user, upd: dict, *, gap_state: dict, gap_seconds:
         tg.send("이미 처리된 이벤트라 수정할 수 없습니다")
         return
     old = db.get_draft(conn, event_id)
-    new_id = tg.send(_draft_message(row["title"], text), buttons=_buttons(event_id))
+    notes = db.get_meta(conn, f"draft_notes:{event_id}") or ""
+    new_id = tg.send(_draft_message(row["title"], text, notes), buttons=_buttons(event_id))
     db.set_draft(conn, event_id, text, new_id)
     if old and old["message_id"]:
         tg.clear_buttons(old["message_id"])

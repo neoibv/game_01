@@ -177,3 +177,60 @@ def test_scheduled_backup_run_is_skipped_when_recent(tmp_path, monkeypatch, caps
     conn.close()
     cli.cmd_collect(argparse.Namespace(db=str(path), reset_events=False, skip_if_ran_within_hours=20))
     assert "건너뜀" in capsys.readouterr().out
+
+
+def test_decide_skips_passed_deadline_and_signup_conditions():
+    from datetime import datetime, timezone
+    now = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    old = Extracted(is_giveaway=True, form_url="https://x", deadline="2026-10-20T23:59")
+    assert cli._decide(old, "t", now=now) == "skipped"  # AI가 종료를 놓쳐도 마감일로 거름
+    paid = Extracted(is_giveaway=True, form_url="https://x", requires_purchase_or_signup=True,
+                     signup_condition="알뜰폰 개통")
+    assert cli._decide(paid, "t", {"exclude_signup_required": True}, now) == "skipped"
+    assert cli._decide(paid, "t", {"exclude_signup_required": False}, now) == "confirmed"
+    ok = Extracted(is_giveaway=True, form_url="https://x", deadline="2026-11-08T23:59")
+    assert cli._decide(ok, "t", None, now) == "confirmed"
+
+
+def test_digest_shows_steps_format_and_condition():
+    text = digest.format_youtube([digest.YtEntry(
+        "보겸TV", "아이폰 선물", "아이폰18", "", "https://y/1",
+        steps=["구독", "댓글", "구글폼"], entry_format="보겸으로 3행시", format_inferred=True,
+        condition="알뜰폰 개통")])
+    assert "응모 방법: 구독 → 댓글 → 구글폼" in text
+    assert "응모양식: 보겸으로 3행시 (댓글 패턴으로 추정" in text and "⚠️ 조건: 알뜰폰 개통" in text
+
+
+@respx.mock(assert_all_called=False)
+def test_format_in_video_channel_is_analyzed_without_keywords(tmp_path, respx_mock):
+    respx_mock.get(f"{API}/channels").respond(json={"items": [{
+        "id": "UC1", "contentDetails": {"relatedPlaylists": {"uploads": "UU1"}}}]})
+    respx_mock.get(f"{API}/playlistItems").respond(json={"items": [
+        {"contentDetails": {"videoId": "v1", "videoPublishedAt": "2999-01-01T00:00:00Z"}}]})
+    respx_mock.get(f"{API}/videos").respond(json={"items": [{
+        "id": "v1", "snippet": {"title": "아이폰 대방출", "description": "보겸TV",
+                                "publishedAt": "2999-01-01T00:00:00Z"}}]})
+    respx_mock.get(f"{API}/commentThreads").respond(json={"items": [
+        {"snippet": {"topLevelComment": {"snippet": {"authorChannelId": {"value": "U1"},
+                                                      "textDisplay": "보겸으로 삼행시 참여합니다"}}}}]})
+    conn = db.connect(tmp_path / "t.db")
+    sent = []
+    ex = Ex(Extracted(is_giveaway=True, many_similar_entries=True, product="아이폰18",
+                      entry_format="보겸으로 3행시", format_confidence="low", entry_steps=["댓글"]))
+    chans = [{"name": "보겸TV", "handle": "@x", "format_in_video": True}]
+    cli.collect(conn, YouTubeClient("k", httpx.Client()), chans, FILTERS, sent.append, ex)
+    assert ex.calls[0]["format_in_video"] is True
+    assert ex.calls[0]["comments"] == ["보겸으로 삼행시 참여합니다"]  # 인기순·최신순 합쳐도 중복 제거
+    msg = next(m for m in sent if m.startswith("<유튜브>"))
+    assert "응모양식: 보겸으로 3행시 (댓글 패턴으로 추정" in msg
+
+
+@respx.mock(assert_all_called=False)
+def test_ordinary_channel_still_needs_keywords(tmp_path, respx_mock):
+    _two_videos(respx_mock, ["그냥 응원합니다"])
+    respx_mock.get(f"{API}/videos").respond(json={"items": [
+        {"id": "v1", "snippet": {"title": "리뷰", "description": "평범", "publishedAt": "2999-01-01T00:00:00Z"}}]})
+    conn = db.connect(tmp_path / "t.db")
+    ex = Ex(Extracted(is_giveaway=True, form_url="https://x"))
+    cli.collect(conn, YouTubeClient("k", httpx.Client()), CHANNELS, FILTERS, lambda m: None, ex)
+    assert ex.calls == []  # 키워드가 없으면 AI를 호출하지 않는다

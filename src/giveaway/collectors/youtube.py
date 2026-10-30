@@ -49,11 +49,11 @@ class YouTubeClient:
                                  s.get("description", ""), s["publishedAt"]))
         return out
 
-    def comments(self, video_id: str, channel_id: str) -> tuple[str, list[str]]:
-        """(채널 주인이 쓴 댓글, 그 외 상위 댓글들). 댓글이 막힌 영상은 ("", [])."""
+    def comments(self, video_id: str, channel_id: str, order: str = "relevance") -> tuple[str, list[str]]:
+        """(채널 주인이 쓴 댓글, 그 외 댓글들). order는 relevance(인기순) 또는 time(최신순). 댓글이 막힌 영상은 ("", [])."""
         try:
             data = self._get("commentThreads", part="snippet", videoId=video_id,
-                             order="relevance", maxResults=50, textFormat="plainText")
+                             order=order, maxResults=50, textFormat="plainText")
         except httpx.HTTPStatusError:
             return "", []
         pinned, others = "", []
