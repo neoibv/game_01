@@ -10,6 +10,10 @@ class Video:
     published_at: str
     pinned_comment: str = ""
     channel_id: str = ""
+    comment_count: int = 0
+    view_count: int = 0
+    subscribers: int | None = None   # 발견 기능에서만 채워짐(비공개면 None)
+    subscribers_known: bool = False
 
     @property
     def url(self) -> str:

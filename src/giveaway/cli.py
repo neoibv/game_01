@@ -10,7 +10,7 @@ import json
 
 import yaml
 
-from . import approval, auth, db, digest, state, winners
+from . import approval, auth, db, digest, discover, state, winners
 from .collectors import community as community_mod
 from .collectors import sites as sites_mod
 from .collectors.youtube import YouTubeClient
@@ -164,7 +164,8 @@ class _Confirmed:
 
 
 def _confirm(conn, url: str, ex: Extracted | None, *, title: str, channel: str, text: str,
-             tags: list[str], channel_id: str, video_id: str, video_check: bool = False) -> digest.YtEntry:
+             tags: list[str], channel_id: str, video_id: str, video_check: bool = False,
+             comment_count: int | None = None) -> digest.YtEntry:
     link = ""
     if ex is None:
         m = EXTERNAL_LINK.search(text)
@@ -174,7 +175,7 @@ def _confirm(conn, url: str, ex: Extracted | None, *, title: str, channel: str, 
         db.update_event(conn, url, video_id=video_id, channel_id=channel_id)
         return entry
     sc = score(tags=tags, prize_value_est=ex.prize_value_est, entry_methods=ex.entry_methods,
-               deadline=ex.deadline, now=_now())
+               deadline=ex.deadline, now=_now(), comment_count=comment_count)
     product = ex.product or ex.prize
     db.update_event(
         conn, url, prize=ex.prize, product=product, category=ex.category,
@@ -324,9 +325,23 @@ def collect_community(conn, yt, ch: dict, channel_id: str, extractor: Extractor,
     return out
 
 
+def _fmt_count(n: int | None) -> str:
+    if n is None:
+        return "비공개"
+    return f"{n / 10000:.1f}만" if n >= 10000 else f"{n:,}"
+
+
+def _reach(video) -> str:
+    parts = []
+    if video.subscribers is not None or video.subscribers_known:
+        parts.append(f"구독자 {_fmt_count(video.subscribers)}")
+    parts.append(f"댓글 {video.comment_count:,}개")
+    return " · ".join(parts)
+
+
 def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
             notify, extractor: Extractor | None = None, tg: Telegram | None = None,
-            community_fetch=None) -> dict:
+            community_fetch=None, discovery: dict | None = None) -> dict:
     """유튜브 이벤트를 한 메시지로 묶어 보낸다.
     확정 기준: 진행 중인 경품 이벤트이면서 (응모 링크가 있거나 여러 시청자가 같은 양식으로 댓글 참여).
     근거가 아직 없는 영상은 pending으로 두고 PENDING_HOURS 동안 다시 확인한다.
@@ -371,6 +386,74 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 confirmed.append(_Confirmed(entry, ex, row["title"], row["raw_text"], True, chc))
                 stats["new"] += 1
 
+    discovery_cfg = discovery or {}
+
+    def handle_video(video, channel_id: str, ch: dict) -> bool:
+        """영상 하나를 판정한다. 알림 한도에 닿으면 True(반복 중단)."""
+        stats["videos"] += 1
+        if len(confirmed) >= MAX_NOTIFY_PER_RUN:
+            return True
+        fmt = bool(ch.get("format_in_video"))
+        det = detect(video.text, filters)
+        pinned, others = "", []
+        fetched = False
+        if not det.is_candidate and not fmt:
+            if ch.get("discovered") and stats.get("discovery_comment_fetches", 0) >= discovery_cfg.get("max_comment_fetches", 60):
+                return False
+            if ch.get("discovered"):
+                stats["discovery_comment_fetches"] = stats.get("discovery_comment_fetches", 0) + 1
+            pinned, others = yt.comments(video.video_id, channel_id)
+            fetched = True
+            video.pinned_comment = pinned
+            det = detect(video.text, filters)
+        if not det.is_candidate and not fmt:
+            return False
+        if db.url_exists(conn, video.url):
+            return False
+        if not fetched or fmt:
+            pinned, others = _gather_comments(yt, video.video_id, channel_id, fmt)
+            video.pinned_comment = pinned
+            det = detect(video.text, filters)  # 고정댓글까지 포함해 다시 키워드 확인
+        db.add_event(conn, source="youtube", source_url=video.url, title=video.title,
+                     host=video.channel_name, matched=det.matched, raw_text=video.text)
+        db.update_event(conn, video.url, video_id=video.video_id, channel_id=channel_id,
+                        published_at=video.published_at)
+        ex = None
+        if extractor:
+            try:
+                ex = analyze_video(extractor, text=video.text, title=video.title,
+                                   published_at=video.published_at, pinned=pinned, comments=others, ch=ch)
+            except Exception as e:  # noqa: BLE001 — 지우고 다음 실행에서 재시도
+                print(f"extract 실패({video.url}), 다음 실행에서 재시도: {e}", file=sys.stderr)
+                db.delete_event(conn, video.url)
+                stats["errors"] += 1
+                return False
+        decision = _decide(ex, video.text, filters)
+        if ch.get("discovered") and ex is not None and decision != "skipped" \
+                and ex.category not in discovery_cfg.get("allowed_categories", ["it"]):
+            decision = "skipped"  # 검색으로 찾은 영상은 관심 분야(IT 등)만
+        if decision == "skipped":
+            db.update_event(conn, video.url, status="skipped")
+            stats["skipped"] += 1
+        elif decision == "pending":
+            db.update_event(conn, video.url, status="pending")
+            stats["pending"] += 1
+        else:
+            entry = _confirm(conn, video.url, ex, title=video.title, channel=video.channel_name,
+                             text=video.text, tags=ch.get("tags", []), channel_id=channel_id,
+                             video_id=video.video_id, video_check=ch.get("format_in_video"),
+                             comment_count=video.comment_count)
+            if ch.get("discovered"):
+                entry.discovered = True
+                entry.reach = _reach(video)
+                if len([1 for _ in db.meta_items(conn, "watch:")]) < discovery_cfg.get("max_watched", 60):
+                    db.set_meta(conn, f"watch:{channel_id}", video.channel_name)  # 앞으로도 감시
+            else:
+                entry.reach = _reach(video)
+            confirmed.append(_Confirmed(entry, ex, video.title, video.description, ch=ch))
+            stats["new"] += 1
+        return False
+
     # 2) 새 영상
     for ch in channels:
         cached = db.get_meta(conn, f"channel:{ch['name']}")
@@ -399,55 +482,45 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
             video_events.extend(res["video_events"])
             stats["new"] += len(res["entries"])
             continue
-        ids = yt.recent_video_ids(uploads, published_after)
-        for video in yt.videos(ids, ch["name"]):
-            stats["videos"] += 1
-            if len(confirmed) >= MAX_NOTIFY_PER_RUN:
+        for video in yt.videos(yt.recent_video_ids(uploads, published_after), ch["name"]):
+            if handle_video(video, channel_id, ch):
                 break
-            fmt = bool(ch.get("format_in_video"))
-            det = detect(video.text, filters)
-            pinned, others = "", []
-            fetched = False
-            if not det.is_candidate and not fmt:
-                pinned, others = yt.comments(video.video_id, channel_id)
-                fetched = True
-                video.pinned_comment = pinned
-                det = detect(video.text, filters)
-            if not det.is_candidate and not fmt:
+
+    # 2-2) 이전에 이벤트를 연 적 있어 자동으로 감시 목록에 올라간 채널(발견 기능)
+    configured_ids = {m.split("|")[0] for c in channels
+                      for m in [db.get_meta(conn, f"channel:{c['name']}")] if m}
+    watched = []
+    if extractor and discovery_cfg.get("enabled", True):
+        for key, name in db.meta_items(conn, "watch:"):
+            cid = key[len("watch:"):]
+            if cid not in configured_ids and len(watched) < discovery_cfg.get("max_watched", 60):
+                watched.append((cid, name))
+        for cid, name in watched:
+            wch = {"name": name, "tags": ["it"], "discovered": True}
+            try:
+                vids = yt.videos(yt.recent_video_ids("UU" + cid[2:], published_after), name)
+            except Exception as e:  # noqa: BLE001
+                print(f"감시 채널 조회 실패({name}): {e}", file=sys.stderr)
                 continue
-            if db.url_exists(conn, video.url):
-                continue
-            if not fetched or fmt:
-                pinned, others = _gather_comments(yt, video.video_id, channel_id, fmt)
-                video.pinned_comment = pinned
-                det = detect(video.text, filters)  # 고정댓글까지 포함해 다시 키워드 확인
-            db.add_event(conn, source="youtube", source_url=video.url, title=video.title,
-                         host=video.channel_name, matched=det.matched, raw_text=video.text)
-            db.update_event(conn, video.url, video_id=video.video_id, channel_id=channel_id,
-                            published_at=video.published_at)
-            ex = None
-            if extractor:
-                try:
-                    ex = analyze_video(extractor, text=video.text, title=video.title,
-                                       published_at=video.published_at, pinned=pinned, comments=others, ch=ch)
-                except Exception as e:  # noqa: BLE001 — 지우고 다음 실행에서 재시도
-                    print(f"extract 실패({video.url}), 다음 실행에서 재시도: {e}", file=sys.stderr)
-                    db.delete_event(conn, video.url)
-                    stats["errors"] += 1
-                    continue
-            decision = _decide(ex, video.text, filters)
-            if decision == "skipped":
-                db.update_event(conn, video.url, status="skipped")
-                stats["skipped"] += 1
-            elif decision == "pending":
-                db.update_event(conn, video.url, status="pending")
-                stats["pending"] += 1
-            else:
-                entry = _confirm(conn, video.url, ex, title=video.title, channel=video.channel_name,
-                                 text=video.text, tags=ch.get("tags", []), channel_id=channel_id,
-                                 video_id=video.video_id, video_check=ch.get("format_in_video"))
-                confirmed.append(_Confirmed(entry, ex, video.title, video.description, ch=ch))
-                stats["new"] += 1
+            for video in vids:
+                if handle_video(video, cid, wch):
+                    break
+
+    # 2-3) 새 채널 발견: 이벤트 키워드로 최근 영상을 검색해 덜 알려진 채널까지 넓힌다
+    if extractor and discovery_cfg.get("enabled", True) and discovery_cfg.get("queries"):
+        try:
+            found = discover.run_discovery(
+                conn, yt, discovery_cfg, published_after=_iso(_now() - timedelta(days=discovery_cfg.get("lookback_days", 7))),
+                exclude_channel_ids=configured_ids | {c for c, _ in watched})
+        except Exception as e:  # noqa: BLE001 — 검색 실패(쿼터 등)가 기존 수집을 막지 않게
+            print(f"발견 검색 실패: {e}", file=sys.stderr)
+            stats["discovery_error"] = str(e)[:120]
+            found = []
+        stats["discovered_candidates"] = len(found)
+        for video in found:
+            dch = {"name": video.channel_name, "tags": ["it"], "discovered": True}
+            if handle_video(video, video.channel_id, dch):
+                break
 
     # 3) 묶음 전송 후 승인 요청
     if confirmed:
@@ -516,8 +589,10 @@ def cmd_collect(args) -> None:
         print("ANTHROPIC_API_KEY 없음 → AI 추출 없이 기본 알림", file=sys.stderr)
     can_enter = all(os.environ.get(k) for k in
                     ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN"))
+    discovery = yaml.safe_load((ROOT / "config/discovery.yaml").read_text(encoding="utf-8")) \
+        if (ROOT / "config/discovery.yaml").exists() else {}
     stats = collect(conn, YouTubeClient(_env("YOUTUBE_API_KEY")), channels, filters,
-                    notify, extractor, tg if (extractor and can_enter) else None)
+                    notify, extractor, tg if (extractor and can_enter) else None, discovery=discovery)
     enabled = yaml.safe_load((ROOT / "config/sources.yaml").read_text(encoding="utf-8"))["sites"]
     items, failed = sites_mod.fetch_all(_now().date(), enabled=enabled)
     site_stats = collect_sites(conn, items, filters, notify, extractor)

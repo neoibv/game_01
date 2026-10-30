@@ -18,7 +18,7 @@ def parse_deadline(value: str) -> datetime | None:
 
 
 def score(*, tags: list[str], prize_value_est: int, entry_methods: list[str],
-          deadline: str, now: datetime) -> int:
+          deadline: str, now: datetime, comment_count: int | None = None) -> int:
     s = 0
     if "it" in tags:
         s += 30
@@ -32,4 +32,6 @@ def score(*, tags: list[str], prize_value_est: int, entry_methods: list[str],
             s += 20
         elif left <= 72:
             s += 10
+    if comment_count is not None:  # 댓글이 적을수록 당첨 확률이 높다
+        s += 10 if comment_count < 100 else 5 if comment_count < 1000 else -5 if comment_count > 20000 else 0
     return max(0, min(s, 100))
