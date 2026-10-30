@@ -133,3 +133,24 @@ def test_old_db_gets_migrated(tmp_path):
     c.close()
     conn = db.connect(p)
     assert "deadline" in {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+
+
+@respx.mock
+def test_api_error_includes_response_body_and_counts():
+    respx.post(API_URL).respond(400, json={"type": "error", "error": {
+        "type": "invalid_request_error", "message": "Your credit balance is too low"}})
+    ex = Extractor("k")
+    try:
+        ex.extract("본문", title="t", published_at="", today="")
+        raise AssertionError("raise 안 됨")
+    except RuntimeError as e:
+        assert "credit balance is too low" in str(e)
+    assert ex.errors == 1 and "400" in ex.last_error
+
+
+def test_tool_schema_properties_all_have_types():
+    from giveaway.extract import SCHEMA
+    for name, prop in SCHEMA["properties"].items():
+        assert "type" in prop, name
+        if prop["type"] == "array":
+            assert "type" in prop["items"], name

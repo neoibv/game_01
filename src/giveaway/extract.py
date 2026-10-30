@@ -16,14 +16,14 @@ SCHEMA = {
         "prize_value_est": {"type": "integer", "description": "경품 총 추정 가치(원). 모르면 0"},
         "entry_methods": {
             "type": "array",
-            "items": {"enum": ["comment", "subscribe", "like", "google_form", "form", "click", "sns_share", "other"]},
+            "items": {"type": "string", "enum": ["comment", "subscribe", "like", "google_form", "form", "click", "sns_share", "other"]},
         },
         "required_keywords": {"type": "array", "items": {"type": "string"}, "description": "댓글에 반드시 넣어야 하는 문구/해시태그"},
         "comment_prompt": {"type": "string", "description": "댓글로 답해야 하는 질문/주제. 없으면 빈 문자열"},
         "form_url": {"type": "string", "description": "응모/참여용 링크(구글폼, 이벤트 페이지 등) 중 본문에 실제로 적힌 URL. 영상·채널·SNS 홍보 링크는 제외. 없으면 빈 문자열"},
         "many_similar_entries": {"type": "boolean", "description": "시청자 댓글 중 여러 개가 같은 양식/문구(질문 답변 형식, 같은 해시태그, '참여합니다' 등)로 달려 있어 실제 응모가 진행 중으로 보이는가. 일반 감상 댓글이 대부분이면 false. 댓글이 주어지지 않았으면 false"},
         "product": {"type": "string", "description": "경품 제품명(브랜드+모델). 없으면 빈 문자열"},
-        "category": {"enum": ["it", "baby", "gift_travel", "other"],
+        "category": {"type": "string", "enum": ["it", "baby", "gift_travel", "other"],
                      "description": "경품 분류. it=PC부품·전자기기·가전·스마트기기, baby=아기용품·출산준비용품, gift_travel=기프티콘·상품권·여행·숙박, other=그 외"},
         "deadline": {"type": "string", "description": "응모 마감 YYYY-MM-DD 또는 YYYY-MM-DDTHH:MM. 모르면 빈 문자열"},
         "announce_at": {"type": "string", "description": "당첨 발표일 YYYY-MM-DD. 모르면 빈 문자열"},
@@ -87,6 +87,18 @@ class Extractor:
         self.api_key = api_key
         self.http = client or httpx.Client(timeout=60)
         self.model = model
+        self.errors = 0
+        self.last_error = ""
+
+    def _post(self, payload: dict) -> dict:
+        """API 오류는 응답 본문(원인)을 포함한 메시지로 올린다. httpx 기본 메시지에는 본문이 없다."""
+        resp = self.http.post(API_URL, headers={"x-api-key": self.api_key,
+                                                "anthropic-version": "2023-06-01"}, json=payload)
+        if resp.status_code >= 400:
+            self.errors += 1
+            self.last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            raise RuntimeError(self.last_error)
+        return resp.json()
 
     def extract(self, text: str, *, title: str, published_at: str, today: str,
                 comments: list[str] | None = None) -> Extracted:
@@ -94,22 +106,17 @@ class Extractor:
         if comments:
             lines = "\n".join(f"- {c[:120]}" for c in comments[:40])
             comment_block = f"\n\n--- 시청자 댓글 상위 {min(len(comments), 40)}개 ---\n{lines}"
-        resp = self.http.post(
-            API_URL,
-            headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
-            json={
-                "model": self.model,
-                "max_tokens": 1024,
-                "system": SYSTEM,
-                "tools": [{"name": TOOL_NAME, "description": "추출 결과 기록", "input_schema": SCHEMA}],
-                "tool_choice": {"type": "tool", "name": TOOL_NAME},
-                "messages": [{"role": "user", "content": (
-                    f"오늘 날짜: {today}\n영상 제목: {title}\n게시일: {published_at}\n\n"
-                    f"--- 본문 ---\n{text[:6000]}{comment_block}")}],
-            },
-        )
-        resp.raise_for_status()
-        for block in resp.json().get("content", []):
+        data = self._post({
+            "model": self.model,
+            "max_tokens": 1024,
+            "system": SYSTEM,
+            "tools": [{"name": TOOL_NAME, "description": "추출 결과 기록", "input_schema": SCHEMA}],
+            "tool_choice": {"type": "tool", "name": TOOL_NAME},
+            "messages": [{"role": "user", "content": (
+                f"오늘 날짜: {today}\n영상 제목: {title}\n게시일: {published_at}\n\n"
+                f"--- 본문 ---\n{text[:6000]}{comment_block}")}],
+        })
+        for block in data.get("content", []):
             if block.get("type") == "tool_use" and block.get("name") == TOOL_NAME:
                 return Extracted.from_dict(block["input"])
         raise ValueError("tool_use 블록이 응답에 없음")
@@ -129,14 +136,9 @@ def _draft_prompt(video_title: str, description: str, ex: "Extracted") -> str:
 
 
 def _draft_comment(self: "Extractor", video_title: str, description: str, ex: "Extracted") -> str:
-    resp = self.http.post(
-        API_URL,
-        headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
-        json={"model": self.model, "max_tokens": 400, "system": DRAFT_SYSTEM,
-              "messages": [{"role": "user", "content": _draft_prompt(video_title, description, ex)}]},
-    )
-    resp.raise_for_status()
-    text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text").strip()
+    data = self._post({"model": self.model, "max_tokens": 400, "system": DRAFT_SYSTEM,
+                       "messages": [{"role": "user", "content": _draft_prompt(video_title, description, ex)}]})
+    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
     if not text:
         raise ValueError("빈 댓글 초안")
     # 모델이 필수 문구를 빠뜨리면 덧붙인다.

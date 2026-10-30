@@ -337,6 +337,14 @@ def cmd_collect(args) -> None:
             win = winners.check(conn, YouTubeClient(_env("YOUTUBE_API_KEY")), user, notify)
         except Exception as e:  # noqa: BLE001 — 당첨 확인 실패가 수집을 막지 않게
             print(f"당첨 확인 실패: {e}", file=sys.stderr)
+    # AI 분석이 실패하면 로그를 안 봐도 알 수 있게 텔레그램으로 알린다(같은 원인은 반복 알림 안 함)
+    if extractor and extractor.errors:
+        msg = f"⚠️ AI 분석 {extractor.errors}건 실패 — 키워드로 대체했거나 다음 실행에서 재시도합니다.\n{extractor.last_error}"
+        if db.get_meta(conn, "ai_error") != extractor.last_error:
+            notify(msg)
+        db.set_meta(conn, "ai_error", extractor.last_error)
+    elif extractor:
+        db.set_meta(conn, "ai_error", "")
     print(stats, site_stats, remind_and_expire(conn, notify), win)
 
 
