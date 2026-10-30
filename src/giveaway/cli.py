@@ -304,6 +304,12 @@ def cmd_collect(args) -> None:
     conn = db.connect(Path(args.db))
     if args.reset_events:
         print("알림 기록 초기화:", db.reset_events(conn), "건 삭제")
+    if args.skip_if_ran_within_hours:
+        last = db.get_meta(conn, "last_collect_at")
+        if last and _now() - datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc) < timedelta(hours=args.skip_if_ran_within_hours):
+            print(f"최근 {args.skip_if_ran_within_hours}시간 안에 이미 실행됨 — 건너뜀 ({last})")
+            return
     tg = Telegram(token, chat)
     notify = tg.send
     key = os.environ.get("ANTHROPIC_API_KEY")
@@ -359,6 +365,8 @@ def main() -> None:
     sub = p.add_subparsers(required=True)
     c = sub.add_parser("collect")
     c.add_argument("--db", default="data/giveaways.db")
+    c.add_argument("--skip-if-ran-within-hours", type=float, default=0,
+                   help="마지막 수집이 이 시간 안이면 건너뛴다(예약 보조 실행용)")
     c.add_argument("--reset-events", action="store_true",
                    help="이전 알림 기록을 지우고 최근 30일을 새 형식으로 다시 받는다")
     c.set_defaults(func=cmd_collect)
