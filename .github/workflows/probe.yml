@@ -1,0 +1,32 @@
+name: probe
+
+# 개발용 진단(임시). 작업 브랜치 push로만 실행된다.
+on:
+  push:
+    branches: [claude/confident-ptolemy-leaeu8]
+    paths: [.github/workflows/probe.yml, scripts/probe.py]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e . youtube-transcript-api
+      - name: Restore state (read-only)
+        run: |
+          mkdir -p data
+          git fetch origin state --depth=1
+          git show FETCH_HEAD:giveaways.db.enc > data/giveaways.db.enc
+          giveaway state decrypt data/giveaways.db.enc data/giveaways.db
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+      - run: python scripts/probe.py
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
