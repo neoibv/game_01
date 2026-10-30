@@ -164,3 +164,16 @@ def test_reset_events_keeps_entered_and_awaiting(tmp_path):
     assert db.reset_events(conn) == 2
     assert db.get_meta(conn, "last_collect_at") is None
     assert {r["status"] for r in conn.execute("SELECT status FROM events")} == {"entered", "awaiting_approval"}
+
+
+def test_scheduled_backup_run_is_skipped_when_recent(tmp_path, monkeypatch, capsys):
+    import argparse
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "1")
+    monkeypatch.setenv("YOUTUBE_API_KEY", "k")
+    path = tmp_path / "t.db"
+    conn = db.connect(path)
+    db.set_meta(conn, "last_collect_at", cli._iso(cli._now() - timedelta(hours=3)))
+    conn.close()
+    cli.cmd_collect(argparse.Namespace(db=str(path), reset_events=False, skip_if_ran_within_hours=20))
+    assert "건너뜀" in capsys.readouterr().out

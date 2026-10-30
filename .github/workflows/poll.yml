@@ -28,7 +28,10 @@ jobs:
           STATE_KEY: ${{ secrets.STATE_KEY }}
       - name: Poll Telegram
         run: |
-          if [ -z "$YOUTUBE_REFRESH_TOKEN" ]; then echo "YouTube OAuth 미설정 — 건너뜀"; exit 0; fi
+          if [ -z "$YOUTUBE_CLIENT_ID" ] || [ -z "$YOUTUBE_CLIENT_SECRET" ] || [ -z "$YOUTUBE_REFRESH_TOKEN" ]; then
+            echo "::warning::YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET / YOUTUBE_REFRESH_TOKEN 중 비어 있는 Secret이 있어 건너뜀"
+            exit 0
+          fi
           giveaway poll
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
