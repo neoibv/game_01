@@ -154,3 +154,23 @@ def test_tool_schema_properties_all_have_types():
         assert "type" in prop, name
         if prop["type"] == "array":
             assert "type" in prop["items"], name
+
+
+def test_placeholder_strings_are_cleaned():
+    ex = Extracted.from_dict({"is_giveaway": True, "deadline": '""', "comment_prompt": "본문에 댓글 주제는 명시되지 않음",
+                              "entry_format": "없음", "prize": "수량 미기재 랜덤박스", "form_url": "https://x"})
+    assert ex.deadline == "" and ex.comment_prompt == "" and ex.entry_format == ""
+    assert ex.prize == "수량 미기재 랜덤박스" and ex.form_url == "https://x"  # 정상 값은 건드리지 않음
+
+
+@respx.mock
+def test_truncated_response_is_an_error_not_a_half_comment():
+    respx.post(API_URL).respond(json={"stop_reason": "max_tokens",
+                                       "content": [{"type": "text", "text": "새로 나온 Z플립8 실물은"}]})
+    ex = Extractor("k")
+    try:
+        ex.draft_comment("t", "d", Extracted())
+        raise AssertionError("raise 안 됨")
+    except RuntimeError as e:
+        assert "max_tokens" in str(e)
+    assert ex.errors == 1

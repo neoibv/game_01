@@ -70,6 +70,20 @@ SYSTEM = (
 )
 
 
+_BLANKS = {'""', "''", "없음", "해당 없음", "해당없음", "미정", "미상", "n/a", "-", "null", "none"}
+_CLEAN_FIELDS = {"comment_prompt", "deadline", "announce_at", "announce_where", "entry_format",
+                 "signup_condition", "form_url"}
+
+
+def _clean(key: str, value):
+    """AI가 빈 값을 '""'나 '명시되지 않음' 같은 문구로 채우는 경우를 빈 문자열로 바로잡는다."""
+    if key in _CLEAN_FIELDS and isinstance(value, str):
+        v = value.strip()
+        if v.lower() in _BLANKS or "명시되지 않" in v or "언급되지 않" in v:
+            return ""
+    return value
+
+
 @dataclass
 class Extracted:
     is_giveaway: bool = False
@@ -100,7 +114,7 @@ class Extracted:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Extracted":
-        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        known = {k: _clean(k, v) for k, v in d.items() if k in cls.__dataclass_fields__}
         return cls(**known)
 
     @property
@@ -157,12 +171,17 @@ class Extractor:
             self.errors += 1
             self.last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
             raise RuntimeError(self.last_error)
-        return resp.json()
+        data = resp.json()
+        if data.get("stop_reason") == "max_tokens":  # 생각(thinking)이 예산을 먹어 응답이 잘린 경우: 잘린 초안을 보내지 않는다
+            self.errors += 1
+            self.last_error = "응답이 max_tokens에서 잘림"
+            raise RuntimeError(self.last_error)
+        return data
 
     def parse_format(self, user_text: str) -> dict:
         """사용자가 영상을 보고 알려준 댓글 양식(자연어)을 구조화한다."""
         data = self._post({
-            "model": self.model, "max_tokens": 400,
+            "model": self.model, "max_tokens": 1500,
             "system": "사용자가 유튜브 이벤트의 댓글 응모 양식을 말로 설명한다. 말한 내용만 구조화하고 추측하지 않는다. record_format 도구로만 답한다.",
             "tools": [{"name": FORMAT_TOOL, "description": "댓글 양식 기록", "input_schema": FORMAT_SCHEMA}],
             "tool_choice": {"type": "tool", "name": FORMAT_TOOL},
@@ -195,7 +214,7 @@ class Extractor:
             comment_block += f"\n\n--- 시청자 댓글 {min(len(comments), 40)}개 ---\n{lines}"
         data = self._post({
             "model": self.model,
-            "max_tokens": 1024,
+            "max_tokens": 4000,
             "system": SYSTEM,
             "tools": [{"name": TOOL_NAME, "description": "추출 결과 기록", "input_schema": SCHEMA}],
             "tool_choice": {"type": "tool", "name": TOOL_NAME},
@@ -225,7 +244,7 @@ def _draft_prompt(video_title: str, description: str, ex: "Extracted") -> str:
 
 
 def _draft_comment(self: "Extractor", video_title: str, description: str, ex: "Extracted") -> str:
-    data = self._post({"model": self.model, "max_tokens": 400, "system": DRAFT_SYSTEM,
+    data = self._post({"model": self.model, "max_tokens": 2000, "system": DRAFT_SYSTEM,
                        "messages": [{"role": "user", "content": _draft_prompt(video_title, description, ex)}]})
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
     if not text:

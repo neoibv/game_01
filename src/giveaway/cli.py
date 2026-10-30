@@ -461,7 +461,7 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 eid = db.event_id_by_url(conn, c.entry.url)
                 if c.entry.url.startswith("https://www.youtube.com/post/"):
                     # 커뮤니티 게시글 댓글은 API로 작성할 수 없다 → 초안만 보내 사용자가 직접 단다
-                    if c.ex.comment_target in ("post", "both") and (c.ex.required_keywords or c.ex.entry_format):
+                    if c.ex.comment_target in ("post", "both"):
                         approval.propose(conn, tg, extractor, eid, c.title, c.description, c.ex,
                                          manual=f"커뮤니티 게시글 댓글은 API로 작성할 수 없어요. 아래 초안을 복사해 "
                                                 f"게시글에 직접 달아주세요: {c.entry.url}")

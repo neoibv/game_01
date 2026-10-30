@@ -243,3 +243,22 @@ def test_do_post_subscribes_all_listed_channels(tmp_path):
     u = U()
     assert approval.do_post(conn, u, eid).startswith("✅")
     assert sorted(u.subs) == ["UC1", "UCS"]
+
+
+@respx.mock(assert_all_called=False)
+def test_post_without_keywords_still_gets_manual_draft(tmp_path, respx_mock):
+    respx_mock.get(f"{API}/channels").respond(json={"items": [{
+        "id": "UC1", "contentDetails": {"relatedPlaylists": {"uploads": "UU1"}}}]})
+    respx_mock.get(f"{API}/videos").respond(json={"items": []})
+    conn = db.connect(tmp_path / "t.db")
+    tg, sent = FakeTG(), []
+
+    class FreeForm(PostExtractor):
+        def extract(self, text, **kw):
+            return Extracted(is_giveaway=True, product="랜덤박스", entry_methods=["subscribe", "like", "comment"],
+                             comment_target="post")
+
+    posts = community.parse_posts(FX.read_text(encoding="utf-8"), "UC1")[:1]
+    cli.collect(conn, YouTubeClient("k", httpx.Client()), [{**CH, "handle": "@x"}], {"include": []},
+                sent.append, FreeForm(), tg, community_fetch=lambda cid: posts)
+    assert any("복사해" in t for _, t, _ in tg.sent)  # 키워드가 없어도 자유 댓글 초안은 보낸다
