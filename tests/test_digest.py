@@ -234,3 +234,72 @@ def test_ordinary_channel_still_needs_keywords(tmp_path, respx_mock):
     ex = Ex(Extracted(is_giveaway=True, form_url="https://x"))
     cli.collect(conn, YouTubeClient("k", httpx.Client()), CHANNELS, FILTERS, lambda m: None, ex)
     assert ex.calls == []  # 키워드가 없으면 AI를 호출하지 않는다
+
+
+def _fmt_ch(**kw):
+    return {"format_in_video": True, "usual_methods": ["subscribe", "like", "comment"],
+            "usual_steps": ["구독", "좋아요", "알림 설정"], "max_age_days": 14, **kw}
+
+
+class OneShot:
+    def __init__(self, ex):
+        self.ex = ex
+
+    def extract(self, *a, **k):
+        return self.ex
+
+
+def test_owner_pinned_comment_counts_as_event_even_if_ai_says_no():
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 19, 23, tzinfo=timezone.utc)
+    ex = cli.analyze_video(
+        OneShot(Extracted(is_giveaway=False, product="아이폰")), text="t", title="대출받아서 싹다사왔습니다",
+        published_at="2026-09-19T10:20:16Z", comments=[], ch=_fmt_ch(), now=now,
+        pinned="영상에서 말씀드리는 응모양식이 아닐경우 당첨이취소됩니다")
+    assert ex.is_giveaway and ex.owner_announced and ex.is_real_event
+    assert {"subscribe", "like", "comment"} <= set(ex.entry_methods)
+    assert ex.entry_steps[:3] == ["구독", "좋아요", "알림 설정"]
+
+
+def test_owner_hint_ignored_for_winner_announcement_and_regular_channels():
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 20, tzinfo=timezone.utc)
+    ended = cli.analyze_video(OneShot(Extracted()), text="t", title="t", published_at="2026-09-19T10:00:00Z",
+                              comments=[], ch=_fmt_ch(), now=now, pinned="당첨자 발표! 응모양식 확인")
+    assert not ended.is_giveaway
+    normal = cli.analyze_video(OneShot(Extracted()), text="t", title="t", published_at="2026-09-19T10:00:00Z",
+                               comments=[], ch={}, now=now, pinned="응모양식 확인")
+    assert not normal.is_giveaway
+
+
+def test_format_channel_event_without_deadline_expires_after_max_age():
+    from datetime import datetime, timezone
+    ex = cli.analyze_video(OneShot(Extracted(is_giveaway=True, many_similar_entries=True)), text="t", title="t",
+                           published_at="2026-09-19T10:00:00Z", pinned="", comments=[], ch=_fmt_ch(),
+                           now=datetime(2026, 10, 30, tzinfo=timezone.utc))
+    assert ex.is_ended and cli._decide(ex, "t") == "skipped"
+
+
+@respx.mock(assert_all_called=False)
+def test_format_channel_event_asks_user_for_format_instead_of_drafting(tmp_path, respx_mock):
+    from test_approval import FakeTG
+    respx_mock.get(f"{API}/channels").respond(json={"items": [{
+        "id": "UC1", "contentDetails": {"relatedPlaylists": {"uploads": "UU1"}}}]})
+    respx_mock.get(f"{API}/playlistItems").respond(json={"items": [
+        {"contentDetails": {"videoId": "v1", "videoPublishedAt": "2999-01-01T00:00:00Z"}}]})
+    respx_mock.get(f"{API}/videos").respond(json={"items": [{
+        "id": "v1", "snippet": {"title": "아이폰 대방출", "description": "보겸TV",
+                                "publishedAt": "2999-01-01T00:00:00Z"}}]})
+    respx_mock.get(f"{API}/commentThreads").respond(json={"items": [
+        {"snippet": {"topLevelComment": {"snippet": {"authorChannelId": {"value": "UC1"},
+                                                      "textDisplay": "영상에서 말씀드리는 응모양식이 아닐경우 당첨취소"}}}}]})
+    conn = db.connect(tmp_path / "t.db")
+    tg, sent = FakeTG(), []
+    chans = [{"name": "보겸TV", "handle": "@x", "format_in_video": True,
+              "usual_methods": ["subscribe", "like", "comment"], "last_format": "지난 양식"}]
+    cli.collect(conn, YouTubeClient("k", httpx.Client()), chans, FILTERS, sent.append,
+                OneShot(Extracted(is_giveaway=True, entry_methods=["comment"])), tg)
+    assert any(m.startswith("<유튜브>") and "영상 말미에서 확인" in m for m in sent)
+    request = tg.sent[0][1]
+    assert "답장" in request and "지난 양식" in request
+    assert conn.execute("SELECT status FROM events").fetchone()["status"] == "awaiting_format"

@@ -220,3 +220,98 @@ def test_macro_banned_draft_has_no_buttons_and_no_pending_state(tmp_path):
     assert approval.propose(conn, tg, FakeExtractor(), eid, "리뷰", "설명", ex)
     assert tg.sent[0][2] is None and "직접 작성" in tg.sent[0][1]
     assert db.get_event(conn, eid)["status"] == "notified" and db.get_draft(conn, eid) is None
+
+
+# ---- 영상에서만 양식을 안내하는 채널: 사용자가 답장으로 알려주면 초안 생성 ----
+class FormatExtractor(FakeExtractor):
+    def __init__(self, parsed=None, fail=False):
+        self.parsed, self.fail, self.parsed_inputs = parsed or {}, fail, []
+
+    def parse_format(self, text):
+        self.parsed_inputs.append(text)
+        if self.fail:
+            raise RuntimeError("x")
+        return self.parsed
+
+
+def _format_event(tmp_path):
+    conn, eid = _setup(tmp_path, methods="subscribe,like,comment")
+    conn.execute("UPDATE events SET raw_text='영상 설명', requirements=? WHERE id=?",
+                 ('{"steps": ["구독", "좋아요"], "form_url": ""}', eid))
+    conn.commit()
+    tg = FakeTG()
+    msg_id = approval.request_format(conn, tg, eid, "아이폰 대방출", "https://y/v1", "지난번 양식 예시")
+    return conn, eid, tg, msg_id
+
+
+def _reply(text, to_id, chat=42):
+    return {"update_id": 9, "message": {"chat": {"id": chat}, "text": text,
+                                        "reply_to_message": {"message_id": to_id}}}
+
+
+def test_request_format_message_and_state(tmp_path):
+    conn, eid, tg, msg_id = _format_event(tmp_path)
+    text, buttons = tg.sent[0][1], tg.sent[0][2]
+    assert "답장" in text and "지난번 양식 예시" in text and "'같음'" in text
+    assert buttons == [("⏭ 건너뛰기", f"skip:{eid}")]
+    assert db.get_event(conn, eid)["status"] == "awaiting_format"
+    assert db.get_meta(conn, f"format_req:{msg_id}") == str(eid)
+
+
+def test_format_reply_creates_draft_with_buttons_and_remembers_format(tmp_path):
+    conn, eid, tg, msg_id = _format_event(tmp_path)
+    ex = FormatExtractor({"required_keywords": ["보겸", "아이폰듀오"], "comment_min_lines": 2,
+                          "entry_format": "보겸·아이폰듀오 포함 2줄 이상"})
+    approval.handle_update(conn, tg, FakeYT(), _reply("보겸, 아이폰듀오 두 키워드 포함 2줄 이상", msg_id),
+                           gap_state={}, gap_seconds=0, extractor=ex)
+    draft_msg = tg.sent[-1]
+    assert "초안" in draft_msg[1] and draft_msg[2]  # 게시 버튼 포함
+    assert db.get_event(conn, eid)["status"] == "awaiting_approval"
+    assert db.get_meta(conn, "last_format:잇섭") == "보겸, 아이폰듀오 두 키워드 포함 2줄 이상"
+
+
+def test_same_as_last_reuses_previous_format(tmp_path):
+    conn, eid, tg, msg_id = _format_event(tmp_path)
+    db.set_meta(conn, "last_format:잇섭", "보겸 포함 2줄")
+    ex = FormatExtractor({"required_keywords": ["보겸"], "comment_min_lines": 2, "entry_format": "보겸 2줄"})
+    approval.handle_update(conn, tg, FakeYT(), _reply("같음", msg_id), gap_state={}, gap_seconds=0, extractor=ex)
+    assert ex.parsed_inputs == ["보겸 포함 2줄"]
+
+
+def test_format_reply_without_ai_key_explains(tmp_path):
+    conn, eid, tg, msg_id = _format_event(tmp_path)
+    approval.handle_update(conn, tg, FakeYT(), _reply("보겸 2줄", msg_id), gap_state={}, gap_seconds=0)
+    assert "ANTHROPIC_API_KEY" in tg.sent[-1][1]
+    assert db.get_event(conn, eid)["status"] == "awaiting_format"
+
+
+def test_format_reply_parse_failure_keeps_waiting(tmp_path):
+    conn, eid, tg, msg_id = _format_event(tmp_path)
+    approval.handle_update(conn, tg, FakeYT(), _reply("보겸 2줄", msg_id), gap_state={}, gap_seconds=0,
+                           extractor=FormatExtractor(fail=True))
+    assert "해석하지 못했습니다" in tg.sent[-1][1]
+    assert db.get_event(conn, eid)["status"] == "awaiting_format"
+
+
+def test_skip_button_works_while_waiting_for_format(tmp_path):
+    conn, eid, tg, msg_id = _format_event(tmp_path)
+    approval.handle_update(conn, tg, FakeYT(), _cb(f"skip:{eid}", msg_id), gap_state={}, gap_seconds=0)
+    assert db.get_event(conn, eid)["status"] == "skipped"
+
+
+def test_fit_comment_guarantees_keywords_and_lines():
+    from giveaway.extract import fit_comment
+    ex = Extracted(required_keywords=["보겸", "아이폰듀오"], comment_min_lines=2)
+    out = fit_comment("이번 선물 너무 기대돼요. 꼭 받고 싶어요", ex)
+    assert "보겸" in out and "아이폰듀오" in out and len(out.split("\n")) >= 2
+    one_line = fit_comment("보겸 아이폰듀오 가즈아", Extracted(required_keywords=["보겸"], comment_min_lines=2))
+    assert len(one_line.split("\n")) == 2
+    assert fit_comment("그냥 한 줄", Extracted()) == "그냥 한 줄"
+
+
+@respx.mock
+def test_parse_format_calls_tool_and_returns_input():
+    respx.post(API_URL).respond(json={"content": [{"type": "tool_use", "name": "record_format", "input": {
+        "required_keywords": ["보겸", "아이폰듀오"], "comment_min_lines": 2, "entry_format": "x"}}]})
+    out = Extractor("k").parse_format("보겸/아이폰듀오 두 키워드 2줄 이상")
+    assert out["required_keywords"] == ["보겸", "아이폰듀오"] and out["comment_min_lines"] == 2
