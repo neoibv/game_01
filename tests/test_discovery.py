@@ -145,3 +145,86 @@ def test_fewer_comments_means_better_odds_in_score():
     kw = dict(tags=["it"], prize_value_est=100000, entry_methods=["comment"], deadline="", now=now)
     assert score(**kw, comment_count=20) > score(**kw, comment_count=5000) > score(**kw, comment_count=50000)
     assert score(**kw) == score(**kw, comment_count=5000)  # 정보 없으면 중립
+
+
+# ---- 제외 분야(키보드 등) ----
+from giveaway.detect import excluded_topic  # noqa: E402
+
+TOPICS = {"include": ["이벤트", "증정"], "exclude": [], "exclude_topics": ["키보드", "keyboard", "텐키리스"]}
+
+
+def test_excluded_topic_matches_case_insensitively():
+    assert excluded_topic("독거미 키보드 리뷰", TOPICS) == "키보드"
+    assert excluded_topic("Mechanical KEYBOARD giveaway", TOPICS) == "keyboard"
+    assert excluded_topic("이어폰 증정 이벤트", TOPICS) == ""
+    assert excluded_topic("키보드", None) == ""
+
+
+@respx.mock(assert_all_called=False)
+def test_discovery_drops_keyboard_videos_before_ai(tmp_path, respx_mock):
+    respx_mock.get(f"{API}/search").respond(json={"items": [{"id": {"videoId": "vK"}}, {"id": {"videoId": "vE"}}]})
+    respx_mock.get(f"{API}/videos").respond(json={"items": [
+        {"id": "vK", "snippet": {"title": "키보드 리뷰 구독자 이벤트", "description": "", "publishedAt": "2999-01-01T00:00:00Z",
+                                 "channelId": "UCk", "channelTitle": "키보드채널"}, "statistics": {}},
+        {"id": "vE", "snippet": {"title": "이어폰 리뷰 구독자 이벤트", "description": "", "publishedAt": "2999-01-01T00:00:00Z",
+                                 "channelId": "UCe", "channelTitle": "이어폰채널"}, "statistics": {}}]})
+    respx_mock.get(f"{API}/channels").respond(json={"items": [
+        {"id": "UCk", "statistics": {"subscriberCount": "5000"}}, {"id": "UCe", "statistics": {"subscriberCount": "5000"}}]})
+    conn = db.connect(tmp_path / "t.db")
+    found = discover.run_discovery(conn, YouTubeClient("k", httpx.Client()), CFG, published_after="x",
+                                   exclude_channel_ids=set(), filters=TOPICS)
+    assert [v.video_id for v in found] == ["vE"]
+
+
+@respx.mock(assert_all_called=False)
+def test_collect_never_calls_ai_for_excluded_topic_and_drops_ai_flagged_products(tmp_path, respx_mock):
+    respx_mock.get(f"{API}/channels").respond(json={"items": [{
+        "id": "UC1", "contentDetails": {"relatedPlaylists": {"uploads": "UU1"}}}]})
+    respx_mock.get(f"{API}/playlistItems").respond(json={"items": [
+        {"contentDetails": {"videoId": v, "videoPublishedAt": "2999-01-01T00:00:00Z"}} for v in ("vK", "vP")]})
+    respx_mock.get(f"{API}/videos").respond(json={"items": [
+        {"id": "vK", "snippet": {"title": "독거미 키보드 증정 이벤트", "description": "", "publishedAt": "2999-01-01T00:00:00Z",
+                                 "channelId": "UC1", "channelTitle": "채널"}, "statistics": {}},
+        {"id": "vP", "snippet": {"title": "신제품 리뷰 증정 이벤트", "description": "https://forms.gle/x",
+                                 "publishedAt": "2999-01-01T00:00:00Z", "channelId": "UC1", "channelTitle": "채널"}, "statistics": {}}]})
+    respx_mock.get(f"{API}/commentThreads").respond(json={"items": []})
+    conn = db.connect(tmp_path / "t.db")
+
+    class Calls(AiExtractor):
+        def __init__(self):
+            self.n = 0
+
+        def extract(self, text, **kw):
+            self.n += 1
+            return Extracted(is_giveaway=True, form_url="https://forms.gle/x", product="AULA F108 PRO 키보드", category="it")
+
+    ai, sent = Calls(), []
+    stats = cli.collect(conn, YouTubeClient("k", httpx.Client()), [{"name": "채널", "handle": "@x"}], TOPICS,
+                        sent.append, ai, None)
+    assert ai.n == 1  # 제목에 '키보드'가 있는 영상은 AI를 부르지 않는다
+    assert stats["excluded_topic"] == 1 and stats["new"] == 0  # 제품이 키보드로 확인된 영상도 제외
+    assert not any(m.startswith("<유튜브>") for m in sent)
+
+
+def test_sites_skip_excluded_topics(tmp_path):
+    from giveaway.collectors.sites import SiteItem
+    conn = db.connect(tmp_path / "t.db")
+    sent = []
+    items = [SiteItem("jupjup", "https://j/1", "기계식 키보드 추첨", prize="키보드"),
+             SiteItem("jupjup", "https://j/2", "무선 이어폰 추첨", prize="이어폰")]
+    stats = cli.collect_sites(conn, items, TOPICS, sent.append, None)
+    assert stats["new"] == 1 and "이어폰" in sent[0] and "키보드" not in sent[0]
+
+
+def test_existing_open_events_on_excluded_topics_are_closed_and_cannot_be_posted(tmp_path):
+    from giveaway import approval
+    conn = db.connect(tmp_path / "t.db")
+    for url, title in (("https://y/k", "독거미 키보드 이벤트"), ("https://y/e", "이어폰 이벤트")):
+        db.add_event(conn, source="youtube", source_url=url, title=title, host="h", matched=[], raw_text="")
+        db.update_event(conn, url, status="awaiting_approval", video_id="v", entry_methods="comment")
+    kid = db.event_id_by_url(conn, "https://y/k")
+    db.set_draft(conn, kid, "댓글", 1)
+    assert cli.skip_excluded_existing(conn, TOPICS) == 1
+    statuses = {r["source_url"]: r["status"] for r in conn.execute("SELECT source_url, status FROM events")}
+    assert statuses == {"https://y/k": "skipped", "https://y/e": "awaiting_approval"}
+    assert "처리할 수 없는" in approval.do_post(conn, object(), kid)  # 남은 [게시] 버튼도 막힌다

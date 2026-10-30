@@ -21,3 +21,12 @@ def detect(text: str, filters: dict) -> Detection:
             stripped = stripped.replace(k.lower(), "")
         matched = [k for k in filters["include"] if k.lower() in stripped]
     return Detection(matched=matched, excluded=excluded)
+
+
+def excluded_topic(text: str, filters: dict | None) -> str:
+    """제외 분야(exclude_topics)에 걸리는 첫 단어를 돌려준다. 없으면 빈 문자열."""
+    lowered = (text or "").lower()
+    for word in (filters or {}).get("exclude_topics", []):
+        if word.lower() in lowered:
+            return word
+    return ""
