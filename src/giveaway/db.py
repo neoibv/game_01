@@ -192,3 +192,8 @@ def pending_events(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def delete_event(conn: sqlite3.Connection, source_url: str) -> None:
     conn.execute("DELETE FROM events WHERE source_url = ?", (source_url,))
     conn.commit()
+
+
+def meta_items(conn: sqlite3.Connection, prefix: str) -> list[tuple[str, str]]:
+    return [(r["key"], r["value"]) for r in conn.execute(
+        "SELECT key, value FROM meta WHERE key LIKE ? ORDER BY key", (prefix.replace("%", "") + "%",))]

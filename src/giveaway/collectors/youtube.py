@@ -42,12 +42,33 @@ class YouTubeClient:
     def videos(self, video_ids: list[str], channel_name: str = "") -> list[Video]:
         out: list[Video] = []
         for i in range(0, len(video_ids), 50):
-            data = self._get("videos", part="snippet", id=",".join(video_ids[i:i + 50]))
+            data = self._get("videos", part="snippet,statistics", id=",".join(video_ids[i:i + 50]))
             for item in data.get("items", []):
-                s = item["snippet"]
+                s, st = item["snippet"], item.get("statistics", {})
                 out.append(Video(item["id"], channel_name or s.get("channelTitle", ""), s["title"],
                                  s.get("description", ""), s["publishedAt"],
-                                 channel_id=s.get("channelId", "")))
+                                 channel_id=s.get("channelId", ""),
+                                 comment_count=int(st.get("commentCount", 0) or 0),
+                                 view_count=int(st.get("viewCount", 0) or 0)))
+        return out
+
+    def search_videos(self, query: str, published_after: str, category: str = "") -> list[str]:
+        """키워드로 최근 영상 검색(호출당 100 unit). 한국어·한국 지역 우선."""
+        params = {"part": "id", "type": "video", "q": query, "order": "date", "maxResults": 50,
+                  "publishedAfter": published_after, "regionCode": "KR", "relevanceLanguage": "ko"}
+        if category:
+            params["videoCategoryId"] = category
+        data = self._get("search", **params)
+        return [i["id"]["videoId"] for i in data.get("items", []) if i.get("id", {}).get("videoId")]
+
+    def channel_subscribers(self, channel_ids: list[str]) -> dict[str, int | None]:
+        """채널별 구독자 수(비공개면 None). 50개당 1 unit."""
+        out: dict[str, int | None] = {}
+        for i in range(0, len(channel_ids), 50):
+            data = self._get("channels", part="statistics", id=",".join(channel_ids[i:i + 50]))
+            for item in data.get("items", []):
+                st = item.get("statistics", {})
+                out[item["id"]] = None if st.get("hiddenSubscriberCount") else int(st.get("subscriberCount", 0) or 0)
         return out
 
     def comments(self, video_id: str, channel_id: str, order: str = "relevance") -> tuple[str, list[str]]:

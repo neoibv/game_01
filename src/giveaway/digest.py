@@ -51,6 +51,8 @@ class YtEntry:
     comment_rule: str = ""         # 댓글 필수 키워드·최소 줄 수
     membership: str = ""           # 채널 멤버십 필수/우대 여부 표시
     video_check: bool = False      # 양식·멤버십이 영상에서만 안내되는 채널
+    reach: str = ""                # 구독자·댓글 수(경쟁 정도)
+    discovered: bool = False       # 검색으로 새로 발견한 채널
     target: str = ""               # 댓글을 달 곳(게시글/영상/둘 다)
     linked: list[str] = field(default_factory=list)  # 게시물에 연결된 영상 "제목 — URL"
 
@@ -89,6 +91,8 @@ def format_youtube(entries: list[YtEntry]) -> str:
             lines.append(f"💳 멤버십: {e.membership}")
         if e.condition:
             lines.append(f"⚠️ 조건: {e.condition}")
+        if e.reach:
+            lines.append(f"경쟁: {e.reach}" + (" · 🔭 새로 발견한 채널(앞으로 자동 감시)" if e.discovered else ""))
         lines.append(f"링크: {e.url}")
         if e.apply_link:
             lines.append(f"응모: {e.apply_link}")
