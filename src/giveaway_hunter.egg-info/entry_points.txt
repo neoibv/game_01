@@ -1,0 +1,2 @@
+[console_scripts]
+giveaway = giveaway.cli:main

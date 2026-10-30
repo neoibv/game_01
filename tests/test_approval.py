@@ -22,6 +22,9 @@ class FakeTG:
     def clear_buttons(self, message_id):
         self.cleared.append(message_id)
 
+    def set_keyboard(self, message_id, keyboard):
+        self.keyboards = getattr(self, "keyboards", []) + [(message_id, keyboard)]
+
     def answer_callback(self, cid, text=""):
         self.answered.append((cid, text))
 
@@ -316,3 +319,48 @@ def test_parse_format_calls_tool_and_returns_input():
         "required_keywords": ["보겸", "아이폰듀오"], "comment_min_lines": 2, "entry_format": "x"}}]})
     out = Extractor("k").parse_format("보겸/아이폰듀오 두 키워드 2줄 이상")
     assert out["required_keywords"] == ["보겸", "아이폰듀오"] and out["comment_min_lines"] == 2
+
+
+def test_propose_buttons_include_dislike(tmp_path):
+    conn, eid = _setup(tmp_path)
+    tg = FakeTG()
+    _propose(conn, tg, eid)
+    assert ("🚫 관심없음", f"dislike:{eid}") in tg.sent[0][2]
+
+
+def test_entered_button_records_manual_entry_with_announce_date(tmp_path):
+    conn, eid = _setup(tmp_path)
+    db.update_event(conn, "https://y/v1", announce_at="2026-11-20")
+    tg, yt = FakeTG(), FakeYT()
+    kb = {"inline_keyboard": [[{"text": "a", "callback_data": f"entered:{eid}"}, {"text": "b", "callback_data": f"dislike:{eid}"}],
+                              [{"text": "c", "callback_data": "entered:999"}]]}
+    cb = _cb(f"entered:{eid}", 101)
+    cb["callback_query"]["message"]["reply_markup"] = kb
+    approval.handle_update(conn, tg, yt, cb, gap_state={}, gap_seconds=0)
+    assert db.get_event(conn, eid)["status"] == "entered" and db.has_entry(conn, eid, "manual")
+    assert "2026-11-20" in tg.sent[-1][1]
+    assert tg.keyboards[-1][1] == [kb["inline_keyboard"][1]]  # 다른 이벤트 버튼은 남는다
+    assert db.entered_events(conn)[0]["id"] == eid
+    approval.handle_update(conn, tg, yt, _cb(f"post:{eid}", 101), gap_state={}, gap_seconds=0)
+    assert yt.calls == []  # 이미 응모로 기록된 건 게시되지 않는다
+
+
+def test_dislike_skips_event_and_blocks_related_topic_until_released(tmp_path):
+    conn, eid = _setup(tmp_path)
+    db.update_event(conn, "https://y/v1", product="로지텍 G435 게이밍 헤드셋")
+    tg, yt = FakeTG(), FakeYT()
+    approval.handle_update(conn, tg, yt, _cb(f"dislike:{eid}", 101), gap_state={}, gap_seconds=0)
+    assert db.get_event(conn, eid)["status"] == "skipped"
+    assert "헤드셋" in db.blocked_topics(conn) and "게이밍" in db.blocked_topics(conn)
+    assert "헤드셋" in tg.sent[-1][1]
+    msg = lambda t: {"update_id": 3, "message": {"chat": {"id": 42}, "text": t}}
+    approval.handle_update(conn, tg, yt, msg("차단해제 헤드셋"), gap_state={}, gap_seconds=0)
+    assert "헤드셋" not in db.blocked_topics(conn)
+    approval.handle_update(conn, tg, yt, msg("차단목록"), gap_state={}, gap_seconds=0)
+    assert "게이밍" in tg.sent[-1][1]
+
+
+def test_dislike_without_known_topic_only_skips_that_event(tmp_path):
+    conn, eid = _setup(tmp_path)
+    approval.handle_update(conn, FakeTG(), FakeYT(), _cb(f"dislike:{eid}", 101), gap_state={}, gap_seconds=0)
+    assert db.blocked_topics(conn) == [] and db.get_event(conn, eid)["status"] == "skipped"

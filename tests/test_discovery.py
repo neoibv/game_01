@@ -206,16 +206,6 @@ def test_collect_never_calls_ai_for_excluded_topic_and_drops_ai_flagged_products
     assert not any(m.startswith("<유튜브>") for m in sent)
 
 
-def test_sites_skip_excluded_topics(tmp_path):
-    from giveaway.collectors.sites import SiteItem
-    conn = db.connect(tmp_path / "t.db")
-    sent = []
-    items = [SiteItem("jupjup", "https://j/1", "기계식 키보드 추첨", prize="키보드"),
-             SiteItem("jupjup", "https://j/2", "무선 이어폰 추첨", prize="이어폰")]
-    stats = cli.collect_sites(conn, items, TOPICS, sent.append, None)
-    assert stats["new"] == 1 and "이어폰" in sent[0] and "키보드" not in sent[0]
-
-
 def test_existing_open_events_on_excluded_topics_are_closed_and_cannot_be_posted(tmp_path):
     from giveaway import approval
     conn = db.connect(tmp_path / "t.db")

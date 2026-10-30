@@ -30,3 +30,9 @@ def excluded_topic(text: str, filters: dict | None) -> str:
         if word.lower() in lowered:
             return word
     return ""
+
+
+def blocked_topic(filters: dict | None, *parts: str) -> str:
+    """사용자가 '관심없음'으로 막은 단어(blocked_topics)가 든 첫 단어. 제목·제품·경품처럼 짧은 글에만 쓴다."""
+    lowered = "\n".join(p or "" for p in parts).lower()
+    return next((w for w in (filters or {}).get("blocked_topics", []) if w.lower() in lowered), "")

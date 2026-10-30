@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from . import db
+from . import db, digest
 from .extract import Extracted, Extractor, fit_comment
 from .rank import parse_deadline
 
@@ -17,7 +17,70 @@ def proposable(ex: Extracted) -> bool:
 
 
 def _buttons(event_id: int) -> list[tuple[str, str]]:
-    return [("✅ 게시", f"post:{event_id}"), ("⏭ 건너뛰기", f"skip:{event_id}")]
+    return [("✅ 게시", f"post:{event_id}"), ("⏭ 건너뛰기", f"skip:{event_id}"),
+            ("🚫 관심없음", f"dislike:{event_id}")]
+
+
+def action_buttons(entries: list[tuple[int, str]]) -> list[list[tuple[str, str]]]:
+    """알림 묶음 아래에 붙이는 이벤트별 버튼 줄: 직접 응모했다고 기록 / 관심없음. entries: [(event_id, 짧은 이름)]"""
+    return [[(f"✅ {i}) {name[:14]} 응모함", f"entered:{eid}"), (f"🚫 {i}) 관심없음", f"dislike:{eid}")]
+            for i, (eid, name) in enumerate(entries, 1)]
+
+
+def do_entered(conn, event_id: int) -> str:
+    row = db.get_event(conn, event_id)
+    if row is None:
+        return "이벤트를 찾을 수 없습니다"
+    fresh = db.mark_entered(conn, event_id)
+    when = row["announce_at"] or "미정"
+    return (f"📝 응모 기록: {row['title'][:60]}\n결과 발표: {when}" if fresh
+            else f"이미 응모로 기록된 이벤트입니다 (결과 발표: {when})")
+
+
+def do_dislike(conn, event_id: int) -> str:
+    """이 이벤트를 닫고, 제품 분류 단어를 차단 목록에 올려 관련 이벤트가 다시 알림에 나오지 않게 한다."""
+    row = db.get_event(conn, event_id)
+    if row is None:
+        return "이벤트를 찾을 수 없습니다"
+    if row["status"] != "entered":
+        db.update_event(conn, row["source_url"], status="skipped")
+    specific = f"{row['product'] or ''} {row['prize'] or ''}"
+    words = digest.topic_words(specific) or digest.topic_words(row["title"])
+    if not words and len((row["product"] or "").strip()) >= digest.TOPIC_MIN_LEN:
+        words = [row["product"].strip().lower()]
+    if not words:
+        return "🚫 이 이벤트만 제외했어요 (관련 단어를 찾지 못해 다른 이벤트는 막지 않았습니다)"
+    db.set_blocked_topics(conn, db.blocked_topics(conn) + words)
+    return (f"🚫 '{', '.join(words)}' 관련 이벤트는 앞으로 알리지 않을게요.\n"
+            f"되돌리려면 '차단해제 {words[0]}' 라고 보내세요. (현재 목록: '차단목록')")
+
+
+def _handle_block_command(conn, tg, text: str) -> bool:
+    if text.startswith("차단목록"):
+        words = db.blocked_topics(conn)
+        tg.send("🚫 관심없음으로 막은 단어: " + (", ".join(words) if words else "없음"))
+        return True
+    if text.startswith("차단해제"):
+        word = text[len("차단해제"):].strip().lower()
+        words = db.blocked_topics(conn)
+        if word and word in [w.lower() for w in words]:
+            db.set_blocked_topics(conn, [w for w in words if w.lower() != word])
+            tg.send(f"'{word}' 차단을 풀었어요.")
+        else:
+            tg.send("풀 단어를 정확히 적어 주세요. 예) 차단해제 헤드셋\n현재 목록: " + (", ".join(words) or "없음"))
+        return True
+    return False
+
+
+def _drop_event_buttons(tg, cb: dict, event_id: int) -> None:
+    """눌린 이벤트의 버튼 줄만 지우고, 같은 메시지의 다른 이벤트 버튼은 남긴다."""
+    msg = cb["message"]
+    rows = (msg.get("reply_markup") or {}).get("inline_keyboard") or []
+    left = [r for r in rows if not any(b.get("callback_data", "").endswith(f":{event_id}") for b in r)]
+    if left and len(left) < len(rows):
+        tg.set_keyboard(msg["message_id"], left)
+    else:
+        tg.clear_buttons(msg["message_id"])
 
 
 def _notes(ex: Extracted) -> str:
@@ -268,6 +331,11 @@ def handle_update(conn, tg, yt_user, upd: dict, *, gap_state: dict, gap_seconds:
             tg.send(result)
             if result.startswith("✅"):
                 tg.clear_buttons(msg_id)
+        elif action in ("entered", "dislike"):
+            result = (do_entered if action == "entered" else do_dislike)(conn, event_id)
+            tg.answer_callback(cb["id"], result.splitlines()[0])
+            tg.send(result)
+            _drop_event_buttons(tg, cb, event_id)
         elif action == "skip":
             row = db.get_event(conn, event_id)
             if row and row["status"] in ("awaiting_approval", "awaiting_format"):
@@ -283,6 +351,8 @@ def handle_update(conn, tg, yt_user, upd: dict, *, gap_state: dict, gap_seconds:
         return
     reply = msg.get("reply_to_message")
     text = (msg.get("text") or "").strip()
+    if text and not reply and _handle_block_command(conn, tg, text):
+        return
     if not reply or not text:
         return
     format_event = db.get_meta(conn, f"format_req:{reply['message_id']}")

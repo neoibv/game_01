@@ -3,9 +3,9 @@
 ## Project Overview
 
 giveaway-hunter — 국내 경품·사은품 이벤트를 자동으로 수집하고 응모를 돕는 도구. 알림은 **텔레그램**, 실행은 **GitHub Actions**(PC 불필요).
-소스: IT 유튜버(설정 채널 + **검색으로 발견한 소규모 채널**), 보겸TV/보겸S **커뮤니티 게시물**, 이벤트 모음 사이트(이벤트 코리아·줍줍·다나와).
+소스: IT 유튜버(설정 채널 + **검색으로 발견한 소규모 채널**), 보겸TV/보겸S **커뮤니티 게시물**.
 
-설계 원문은 `docs/PLAN.md`(초기 계획 — 구현은 이후 크게 확장됨, 아래와 README가 현재 기준), 사용자 설정 안내는 `docs/SETUP.md`, 사이트별 가입 안내는 `docs/SETUP_ACCOUNTS.md`.
+설계 원문은 `docs/PLAN.md`(초기 계획 — 구현은 이후 크게 확장됨, 아래와 README가 현재 기준), 사용자 설정 안내는 `docs/SETUP.md`.
 
 ## Quick Start (개발)
 
@@ -20,10 +20,10 @@ Python ≥ 3.12 (워크플로는 3.12). 사용자 PC는 3.10이라 `python -m gi
 
 ```
 src/giveaway/
-├── cli.py            # collect(유튜브·발견·커뮤니티) / collect_sites / poll / watch / auth / state 명령, 판정(_decide, analyze_video)
+├── cli.py            # collect(유튜브·발견·커뮤니티) / poll / watch / auth / state 명령, 판정(_decide, analyze_video)
 ├── extract.py        # Claude(Haiku 5.5) tool use: 이벤트 구조화(Extracted), 댓글 초안, 양식 해석(parse_format), fit_comment
 ├── approval.py       # 텔레그램 초안·[게시] 버튼·양식 요청/답장·'검수' 댓글 검토·do_post/do_fix
-├── digest.py         # 알림 형식(유튜브 묶음 / 사이트 우선순위별 묶음), 분야 분류 키워드, 메시지 분할
+├── digest.py         # 알림 형식(유튜브 묶음 + 하단 '응모한 이벤트·결과 발표일' 기록), 분야 분류·차단어 키워드, 메시지 분할
 ├── discover.py       # 설정 밖 채널 발견(검색 → IT 키워드·구독자 필터 → 구독자 적은 순)
 ├── detect.py         # 이벤트 키워드, 제외 분야(excluded_topic)
 ├── rank.py           # 점수(IT·경품가치·난이도·마감·댓글 수), 마감 파싱
@@ -31,10 +31,10 @@ src/giveaway/
 ├── ghapi.py          # GitHub Actions dispatch / ensure_watcher
 ├── db.py, state.py   # SQLite(+자동 마이그레이션), Fernet 암호화 후 state 브랜치에 저장
 ├── telegram_bot.py   # send / peek_updates(롱폴링, 소비 안 함) / get_updates / answer_callback
-├── collectors/       # youtube.py(API), community.py(게시물 페이지 파싱), sites.py(목록 파서)
+├── collectors/       # youtube.py(API), community.py(게시물 페이지 파싱)
 └── enter/youtube.py  # OAuth 댓글·구독·좋아요·댓글 수정
-config/               # channels.yaml, discovery.yaml, filters.yaml(exclude_topics 포함), sources.yaml
-.github/workflows/    # collect(하루 1회+보조 2회) / poll / watch / sample-sites(수동)
+config/               # channels.yaml, discovery.yaml, filters.yaml(exclude_topics 포함)
+.github/workflows/    # collect(하루 1회+보조 2회) / poll / watch
 ```
 
 ## Rules
@@ -53,7 +53,8 @@ config/               # channels.yaml, discovery.yaml, filters.yaml(exclude_topi
 - **Anthropic Haiku 5.5**: thinking이 max_tokens를 먹어 초안이 잘리거나 비는 일이 있었다 → max_tokens 넉넉히 + `stop_reason == max_tokens`는 오류 처리. AI가 빈 값을 `""`/'명시되지 않음'으로 채우는 경우를 `_clean`으로 보정. API 400은 본문을 오류 메시지에 담는다(크레딧 부족이 흔한 원인).
 - 보겸: 이벤트의 진짜 출처는 **커뮤니티 게시물**(+거기 링크된 영상). 게시물 본문에 키워드·줄 수 양식이 적혀 있고, 링크된 영상의 양식은 영상 말미 음성 안내라 사용자가 답장으로 알려줘야 한다(`format_in_video`). 멤버십은 대개 별도 당첨 풀(필수 아님).
 - 이벤트 판정 기준(유튜브): 진행 중 + (응모 링크 or 다수 시청자의 같은 양식 댓글 or 주인 공식 게시물) 일 때만 확정, 근거 없으면 72시간 보류 재확인. 알림 전송 실패 시 DB에서 지워 재시도(조용한 유실 방지).
-- 접근 불가 사이트(수집 제외): 퀘이사존·슈퍼투데이(Cloudflare), 뽐뿌(403).
+- 이벤트 모음 사이트(이벤트 코리아·줍줍·다나와) 수집은 의미가 없어 제거했다. 다시 붙이지 말 것.
+- 알림마다 이벤트별 [응모함]/[관심없음] 버튼. 응모함 → `entries`에 `manual`로 기록(status `entered`), 알림 하단에 응모 목록과 결과 발표일(`announce_at`). 관심없음 → 이벤트 종료 + 제품 분류 어휘(`digest.KEYWORDS`, 3자 이상)를 meta `blocked_topics`에 저장해 제목·제품·경품에 걸리면 제외('차단해제 단어'·'차단목록' 메시지로 관리).
 
 ## Testing conventions
 
