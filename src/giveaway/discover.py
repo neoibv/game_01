@@ -1,4 +1,6 @@
 """설정한 채널 밖의 IT 유튜버(구독자 적은 곳 포함)를 이벤트 키워드 검색으로 찾는다."""
+import httpx
+
 from . import db, digest
 from .detect import excluded_topic
 from .collectors.youtube import YouTubeClient
@@ -6,11 +8,19 @@ from .models import Video
 
 
 def run_discovery(conn, yt: YouTubeClient, cfg: dict, *, published_after: str,
-                  exclude_channel_ids: set[str], filters: dict | None = None) -> list[Video]:
+                  exclude_channel_ids: set[str], filters: dict | None = None,
+                  errors: list[str] | None = None) -> list[Video]:
     """검색(쿼리당 100 unit) → 새 영상만 → 구독자 수 범위 필터. 구독자 적은 순으로 돌려준다(당첨 확률)."""
     ids: list[str] = []
     for q in cfg.get("queries", [])[: cfg.get("max_queries_per_run", 8)]:
-        for vid in yt.search_videos(q, published_after, cfg.get("category_id", "")):
+        try:
+            found = yt.search_videos(q, published_after, cfg.get("category_id", ""))
+        except httpx.HTTPStatusError as e:
+            # 쿼터/속도 제한(403·429)이면 남은 쿼리도 같은 이유로 실패하니 중단하고, 지금까지 찾은 것만 쓴다
+            if errors is not None:
+                errors.append(f"검색 중단({e.response.status_code}) '{q}'")
+            break
+        for vid in found:
             if vid not in ids:
                 ids.append(vid)
     ids = [v for v in ids if not db.url_exists(conn, f"https://www.youtube.com/watch?v={v}")]

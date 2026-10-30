@@ -102,7 +102,7 @@ def test_non_it_videos_are_filtered_before_ai(tmp_path, respx_mock):
     respx_mock.get(f"{API}/videos").respond(json={"items": [
         {"id": "vX", "snippet": {"title": "화장품 나눔 이벤트", "description": "구독자 이벤트", "publishedAt": "2999-01-01T00:00:00Z",
                                  "channelId": "UCx", "channelTitle": "뷰티"}, "statistics": {}},
-        {"id": "vY", "snippet": {"title": "키보드 리뷰", "description": "구독자 이벤트 증정", "publishedAt": "2999-01-01T00:00:00Z",
+        {"id": "vY", "snippet": {"title": "이어폰 리뷰", "description": "구독자 이벤트 증정", "publishedAt": "2999-01-01T00:00:00Z",
                                  "channelId": "UCy", "channelTitle": "IT리뷰"}, "statistics": {}}]})
     respx_mock.get(f"{API}/channels").respond(json={"items": [
         {"id": "UCx", "statistics": {"subscriberCount": "5000"}}, {"id": "UCy", "statistics": {"subscriberCount": "5000"}}]})
@@ -228,3 +228,34 @@ def test_existing_open_events_on_excluded_topics_are_closed_and_cannot_be_posted
     statuses = {r["source_url"]: r["status"] for r in conn.execute("SELECT source_url, status FROM events")}
     assert statuses == {"https://y/k": "skipped", "https://y/e": "awaiting_approval"}
     assert "처리할 수 없는" in approval.do_post(conn, object(), kid)  # 남은 [게시] 버튼도 막힌다
+
+
+@respx.mock(assert_all_called=False)
+def test_quota_error_keeps_partial_results_and_notifies_once(tmp_path, respx_mock):
+    calls = {"n": 0}
+
+    def search(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json={"items": [{"id": {"videoId": "vA"}}]})
+        return httpx.Response(429, json={"error": {"message": "quota"}})
+
+    respx_mock.get(f"{API}/search").mock(side_effect=search)
+    respx_mock.get(f"{API}/videos").respond(json={"items": [{
+        "id": "vA", "snippet": {"title": "이어폰 리뷰 증정 이벤트", "description": "https://forms.gle/x",
+                                "publishedAt": "2999-01-01T00:00:00Z", "channelId": "UCa", "channelTitle": "작은채널"},
+        "statistics": {"commentCount": "3"}}]})
+    respx_mock.get(f"{API}/channels").respond(json={"items": [{"id": "UCa", "statistics": {"subscriberCount": "1200"}}]})
+    respx_mock.get(f"{API}/commentThreads").respond(json={"items": []})
+    conn = db.connect(tmp_path / "t.db")
+    sent = []
+    yt = YouTubeClient("k", httpx.Client())
+    stats = cli.collect(conn, yt, [], {"include": ["이벤트", "증정"], "exclude": []}, sent.append,
+                        AiExtractor(), None, discovery=CFG)
+    assert stats["new"] == 1 and "429" in stats["discovery_error"]  # 첫 쿼리 결과는 살린다
+    warnings = [m for m in sent if "발견 검색" in m]
+    assert len(warnings) == 1
+    calls["n"] = 0
+    cli.collect(conn, yt, [], {"include": ["이벤트", "증정"], "exclude": []}, sent.append, AiExtractor(), None,
+                discovery=CFG)
+    assert len([m for m in sent if "발견 검색" in m]) == 1  # 같은 원인은 다시 알리지 않는다

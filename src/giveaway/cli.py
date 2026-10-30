@@ -529,14 +529,21 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
 
     # 2-3) 새 채널 발견: 이벤트 키워드로 최근 영상을 검색해 덜 알려진 채널까지 넓힌다
     if extractor and discovery_cfg.get("enabled", True) and discovery_cfg.get("queries"):
+        disc_errors: list[str] = []
         try:
             found = discover.run_discovery(
                 conn, yt, discovery_cfg, published_after=_iso(_now() - timedelta(days=discovery_cfg.get("lookback_days", 7))),
-                exclude_channel_ids=configured_ids | {c for c, _ in watched}, filters=filters)
+                exclude_channel_ids=configured_ids | {c for c, _ in watched}, filters=filters, errors=disc_errors)
         except Exception as e:  # noqa: BLE001 — 검색 실패(쿼터 등)가 기존 수집을 막지 않게
             print(f"발견 검색 실패: {e}", file=sys.stderr)
-            stats["discovery_error"] = str(e)[:120]
+            disc_errors.append(str(e)[:120])
             found = []
+        if disc_errors:
+            stats["discovery_error"] = "; ".join(disc_errors)
+            if db.get_meta(conn, "discovery_error") != stats["discovery_error"]:  # 같은 원인은 반복 알림 안 함
+                notify("⚠️ 새 채널 발견 검색이 일부 실패했습니다(보통 YouTube API 일일 할당량 초과 — 태평양시 자정에 초기화): "
+                       + stats["discovery_error"])
+        db.set_meta(conn, "discovery_error", stats.get("discovery_error", ""))
         stats["discovered_candidates"] = len(found)
         for video in found:
             dch = {"name": video.channel_name, "tags": ["it"], "discovered": True}
