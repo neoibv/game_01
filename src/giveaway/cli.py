@@ -50,10 +50,20 @@ def _deliver_batch(conn, urls: list[str], notify, text: str, keep_pending: set[s
         db.mark_notified(conn, url)
 
 
-def _decide(ex: Extracted | None, text: str) -> str:
+def _expired(deadline: str, now: datetime | None = None) -> bool:
+    dl = parse_deadline(deadline or "")
+    return bool(dl and dl < (now or _now()))
+
+
+def _decide(ex: Extracted | None, text: str, filters: dict | None = None,
+            now: datetime | None = None) -> str:
     """confirmed | pending | skipped. AI가 없으면 외부 응모 링크가 있는 것만 확정."""
     if ex is None:
         return "confirmed" if EXTERNAL_LINK.search(text) else "skipped"
+    if _expired(ex.deadline, now):  # AI가 종료 여부를 놓쳐도 마감일이 지났으면 제외
+        return "skipped"
+    if (filters or {}).get("exclude_signup_required", True) and ex.requires_purchase_or_signup:
+        return "skipped"
     if ex.is_real_event:
         return "confirmed"
     return "pending" if ex.undecided else "skipped"
@@ -86,7 +96,8 @@ def collect_sites(conn, items: list, filters: dict, notify,
                      host=item.host, matched=[], raw_text=item.text)
         # AI가 없으면 키워드/경품 정보가 있는 항목만 후보로 본다
         no_ai_reject = extractor is None and not (item.prize or detect(item.text, filters).is_candidate)
-        if no_ai_reject or (ex is not None and (not ex.is_giveaway or ex.is_ended)):
+        if (no_ai_reject or _expired(item.deadline) or (ex is not None and (
+                not ex.is_giveaway or ex.is_ended or _expired(ex.deadline)))):
             db.update_event(conn, item.url, status="skipped")
             stats["skipped"] += 1
             continue
@@ -164,12 +175,28 @@ def _confirm(conn, url: str, ex: Extracted | None, *, title: str, channel: str, 
         conn, url, prize=ex.prize, product=product, category=ex.category,
         prize_value_est=ex.prize_value_est, entry_methods=",".join(ex.entry_methods),
         requirements=json.dumps({"keywords": ex.required_keywords, "comment_prompt": ex.comment_prompt,
-                                 "form_url": ex.form_url}, ensure_ascii=False),
+                                 "form_url": ex.form_url, "steps": ex.entry_steps,
+                                 "entry_format": ex.entry_format, "format_confidence": ex.format_confidence,
+                                 "signup_condition": ex.signup_condition}, ensure_ascii=False),
         macro_banned=int(ex.macro_banned), auto_enterable=int(ex.auto_enterable),
         deadline=ex.deadline, announce_at=ex.announce_at, announce_where=ex.announce_where,
         score=sc, video_id=video_id, channel_id=channel_id)
-    return digest.YtEntry(channel=channel, title=title, product=product, deadline=ex.deadline,
-                          url=url, apply_link=ex.form_url, score=sc)
+    return digest.YtEntry(
+        channel=channel, title=title, product=product, deadline=ex.deadline, url=url,
+        apply_link=ex.form_url, score=sc, steps=ex.entry_steps, entry_format=ex.entry_format,
+        format_inferred=ex.format_confidence == "low",
+        condition=ex.signup_condition if ex.requires_purchase_or_signup else "")
+
+
+def _gather_comments(yt, video_id: str, channel_id: str, both_orders: bool) -> tuple[str, list[str]]:
+    """인기순 댓글. 응모 양식을 영상으로 안내하는 채널은 최신순도 합쳐서 새로 달리는 양식 댓글까지 본다."""
+    pinned, others = yt.comments(video_id, channel_id)
+    if both_orders:
+        pinned2, recent = yt.comments(video_id, channel_id, order="time")
+        pinned = pinned or pinned2
+        seen = set(others)
+        others = others + [c for c in recent if c not in seen]
+    return pinned, others
 
 
 def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
@@ -184,6 +211,7 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
              "unresolved": []}
     confirmed: list[_Confirmed] = []
     tags_by_name = {c["name"]: c.get("tags", []) for c in channels}
+    format_by_name = {c["name"]: bool(c.get("format_in_video")) for c in channels}
 
     # 1) 이전에 근거가 부족했던 영상 재확인
     if extractor:
@@ -194,13 +222,15 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 db.update_event(conn, url, status="skipped")
                 continue
             try:
-                _, others = yt.comments(row["video_id"], row["channel_id"])
+                fmt = format_by_name.get(row["host"], False)
+                _, others = _gather_comments(yt, row["video_id"], row["channel_id"], fmt)
                 ex = extractor.extract(row["raw_text"], title=row["title"], published_at="",
-                                       today=_now().date().isoformat(), comments=others)
+                                       today=_now().date().isoformat(), comments=others,
+                                       format_in_video=fmt)
             except Exception as e:  # noqa: BLE001
                 print(f"보류 건 재확인 실패({url}): {e}", file=sys.stderr)
                 continue
-            decision = _decide(ex, row["raw_text"])
+            decision = _decide(ex, row["raw_text"], filters)
             if decision == "skipped":
                 db.update_event(conn, url, status="skipped")
             elif decision == "confirmed" and len(confirmed) < MAX_NOTIFY_PER_RUN:
@@ -231,21 +261,23 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
             stats["videos"] += 1
             if len(confirmed) >= MAX_NOTIFY_PER_RUN:
                 break
+            fmt = bool(ch.get("format_in_video"))
             det = detect(video.text, filters)
             pinned, others = "", []
             fetched = False
-            if not det.is_candidate:
+            if not det.is_candidate and not fmt:
                 pinned, others = yt.comments(video.video_id, channel_id)
                 fetched = True
                 video.pinned_comment = pinned
                 det = detect(video.text, filters)
-            if not det.is_candidate:
+            if not det.is_candidate and not fmt:
                 continue
             if db.url_exists(conn, video.url):
                 continue
-            if not fetched:
-                pinned, others = yt.comments(video.video_id, channel_id)
+            if not fetched or fmt:
+                pinned, others = _gather_comments(yt, video.video_id, channel_id, fmt)
                 video.pinned_comment = pinned
+                det = detect(video.text, filters)  # 고정댓글까지 포함해 다시 키워드 확인
             db.add_event(conn, source="youtube", source_url=video.url, title=video.title,
                          host=video.channel_name, matched=det.matched, raw_text=video.text)
             db.update_event(conn, video.url, video_id=video.video_id, channel_id=channel_id)
@@ -253,13 +285,14 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
             if extractor:
                 try:
                     ex = extractor.extract(video.text, title=video.title, published_at=video.published_at,
-                                           today=_now().date().isoformat(), comments=others)
+                                           today=_now().date().isoformat(), comments=others,
+                                           format_in_video=fmt)
                 except Exception as e:  # noqa: BLE001 — 지우고 다음 실행에서 재시도
                     print(f"extract 실패({video.url}), 다음 실행에서 재시도: {e}", file=sys.stderr)
                     db.delete_event(conn, video.url)
                     stats["errors"] += 1
                     continue
-            decision = _decide(ex, video.text)
+            decision = _decide(ex, video.text, filters)
             if decision == "skipped":
                 db.update_event(conn, video.url, status="skipped")
                 stats["skipped"] += 1

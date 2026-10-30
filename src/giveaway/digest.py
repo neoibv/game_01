@@ -1,5 +1,5 @@
 """텔레그램으로 보낼 묶음 메시지 형식."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 LIMIT = 3800  # 텔레그램 4096자 제한 여유
 
@@ -44,6 +44,10 @@ class YtEntry:
     url: str
     apply_link: str = ""
     score: int = 0
+    steps: list[str] = field(default_factory=list)
+    entry_format: str = ""
+    format_inferred: bool = False  # 시청자 댓글 패턴으로 추정한 양식(영상 말미 확인 필요)
+    condition: str = ""            # 가입·구매 등 조건(제외 설정을 껐을 때만 표시됨)
 
 
 @dataclass
@@ -63,8 +67,14 @@ def format_youtube(entries: list[YtEntry]) -> str:
     for i, e in enumerate(sorted(entries, key=lambda x: -x.score), 1):
         lines = [f"{i}) 영상제목: [{e.channel}] {e.title}",
                  f"제품: {e.product or '미상'}",
-                 f"이벤트 기한: {e.deadline or '미상'}",
-                 f"링크: {e.url}"]
+                 f"이벤트 기한: {e.deadline or '미상'}"]
+        if e.steps:
+            lines.append("응모 방법: " + " → ".join(e.steps))
+        if e.entry_format:
+            lines.append(f"응모양식: {e.entry_format}" + (" (댓글 패턴으로 추정 — 영상 말미에서 확인!)" if e.format_inferred else ""))
+        if e.condition:
+            lines.append(f"⚠️ 조건: {e.condition}")
+        lines.append(f"링크: {e.url}")
         if e.apply_link:
             lines.append(f"응모: {e.apply_link}")
         blocks.append("\n".join(lines))

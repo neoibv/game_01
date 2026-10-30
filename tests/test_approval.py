@@ -73,7 +73,7 @@ def _cb(data, msg_id, chat=42):
 
 def test_proposable_rules():
     assert approval.proposable(Extracted(entry_methods=["comment"]))
-    assert not approval.proposable(Extracted(entry_methods=["comment"], macro_banned=True))
+    assert approval.proposable(Extracted(entry_methods=["comment", "google_form"]))  # 폼이 함께 있어도 초안
     assert not approval.proposable(Extracted(entry_methods=["google_form"]))
 
 
@@ -199,3 +199,24 @@ def test_collect_proposes_for_comment_events_only(tmp_path, respx_mock):
     row = conn.execute("SELECT * FROM events").fetchone()
     assert row["status"] == "awaiting_approval" and row["video_id"] == "v1" and row["channel_id"] == "UC1"
     assert tg.sent and tg.sent[0][2]
+
+
+def test_draft_notes_warn_about_inferred_format_and_manual_steps(tmp_path):
+    conn, eid = _setup(tmp_path)
+    tg = FakeTG()
+    ex = Extracted(is_giveaway=True, entry_methods=["subscribe", "comment", "google_form"],
+                   entry_steps=["구독", "댓글", "구글폼 작성"], form_url="https://forms.gle/a",
+                   format_confidence="low", entry_format="보겸으로 3행시")
+    assert approval.propose(conn, tg, FakeExtractor(), eid, "리뷰", "설명", ex)
+    text, buttons = tg.sent[0][1], tg.sent[0][2]
+    assert "추정" in text and "https://forms.gle/a" in text and "구독·좋아요도 함께" in text
+    assert buttons  # 게시 버튼은 있음
+
+
+def test_macro_banned_draft_has_no_buttons_and_no_pending_state(tmp_path):
+    conn, eid = _setup(tmp_path)
+    tg = FakeTG()
+    ex = Extracted(is_giveaway=True, entry_methods=["comment"], macro_banned=True)
+    assert approval.propose(conn, tg, FakeExtractor(), eid, "리뷰", "설명", ex)
+    assert tg.sent[0][2] is None and "직접 작성" in tg.sent[0][1]
+    assert db.get_event(conn, eid)["status"] == "notified" and db.get_draft(conn, eid) is None
