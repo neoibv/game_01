@@ -81,6 +81,7 @@ class Extracted:
     signup_condition: str = ""
     membership: str = "none"
     comment_min_lines: int = 0
+    owner_announced: bool = False  # 코드가 설정: 채널 주인의 고정댓글/설명이 이벤트를 직접 알림
     entry_format: str = ""
     format_confidence: str = "none"
     many_similar_entries: bool = False
@@ -100,7 +101,8 @@ class Extracted:
     @property
     def is_real_event(self) -> bool:
         """진행 중인 경품 이벤트이고, 응모 링크가 있거나 시청자들이 같은 양식으로 참여 중일 때만 확정."""
-        return self.is_giveaway and not self.is_ended and (bool(self.form_url) or self.many_similar_entries)
+        return self.is_giveaway and not self.is_ended and (
+            bool(self.form_url) or self.many_similar_entries or self.owner_announced)
 
     @property
     def undecided(self) -> bool:
@@ -121,6 +123,19 @@ def _comment_line(comment: str) -> str:
     return f"- {prefix}{' ⏎ '.join(parts)[:200]}"
 
 
+FORMAT_TOOL = "record_format"
+FORMAT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "required_keywords": {"type": "array", "items": {"type": "string"},
+                              "description": "댓글에 반드시 포함해야 하는 단어/문구(사용자가 말한 그대로)"},
+        "comment_min_lines": {"type": "integer", "description": "댓글 최소 줄 수. 언급이 없으면 0"},
+        "entry_format": {"type": "string", "description": "양식을 한 줄로 요약(예: '보겸·아이폰듀오 포함 2줄 이상')"},
+    },
+    "required": ["required_keywords", "comment_min_lines", "entry_format"],
+}
+
+
 class Extractor:
     def __init__(self, api_key: str, client: httpx.Client | None = None, model: str = MODEL):
         self.api_key = api_key
@@ -139,6 +154,20 @@ class Extractor:
             raise RuntimeError(self.last_error)
         return resp.json()
 
+    def parse_format(self, user_text: str) -> dict:
+        """사용자가 영상을 보고 알려준 댓글 양식(자연어)을 구조화한다."""
+        data = self._post({
+            "model": self.model, "max_tokens": 400,
+            "system": "사용자가 유튜브 이벤트의 댓글 응모 양식을 말로 설명한다. 말한 내용만 구조화하고 추측하지 않는다. record_format 도구로만 답한다.",
+            "tools": [{"name": FORMAT_TOOL, "description": "댓글 양식 기록", "input_schema": FORMAT_SCHEMA}],
+            "tool_choice": {"type": "tool", "name": FORMAT_TOOL},
+            "messages": [{"role": "user", "content": user_text[:1000]}],
+        })
+        for block in data.get("content", []):
+            if block.get("type") == "tool_use" and block.get("name") == FORMAT_TOOL:
+                return block["input"]
+        raise ValueError("tool_use 블록이 응답에 없음")
+
     def extract(self, text: str, *, title: str, published_at: str, today: str,
                 comments: list[str] | None = None, format_in_video: bool = False) -> Extracted:
         comment_block = ""
@@ -146,7 +175,8 @@ class Extractor:
             comment_block += (
                 "\n\n[채널 특성] 이 채널은 응모 방법을 영상 말미(음성)에서 영상마다 다르게 안내하고, 그 내용은 설명란에 "
                 "없는 경우가 많다. 설명/고정댓글에 '영상에서 말씀드리는 응모양식' 같은 문구가 있거나 다수의 시청자 댓글이 "
-                "같은 양식(예: '보겸으로 N행시', '사연+참여합니다')을 따르면 진행 중인 이벤트로 본다. 그 경우 댓글들의 공통 "
+                "같은 양식(예: '보겸으로 N행시', '사연+참여합니다')을 따르면 진행 중인 이벤트로 본다. 채널 주인의 고정댓글에 '응모양식', "
+                "'응모 방법', '당첨이 취소' 같은 문구가 있으면 그 자체로 진행 중인 이벤트다(양식 내용이 텍스트에 없어도 is_giveaway=true). 그 경우 댓글들의 공통 "
                 "양식을 entry_format에 요약하고 format_confidence는 low로 한다. 일반 감상·응원 댓글뿐이면 이벤트가 아니다.")
         if comments:
             lines = "\n".join(_comment_line(c) for c in comments[:40])

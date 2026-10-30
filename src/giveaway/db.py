@@ -49,6 +49,7 @@ EXTRA_COLUMNS = {
     "reminded": "INTEGER DEFAULT 0",
     "product": "TEXT",
     "category": "TEXT",
+    "published_at": "TEXT",
     "video_id": "TEXT",
     "channel_id": "TEXT",
 }
@@ -115,7 +116,7 @@ def update_event(conn: sqlite3.Connection, source_url: str, **fields) -> None:
 def open_events(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """마감 처리 대상: 알림은 갔고 아직 끝나지 않은 이벤트."""
     return conn.execute(
-        "SELECT * FROM events WHERE status IN ('notified', 'entered', 'awaiting_approval')"
+        "SELECT * FROM events WHERE status IN ('notified', 'entered', 'awaiting_approval', 'awaiting_format')"
     ).fetchall()
 
 
