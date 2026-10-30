@@ -429,6 +429,9 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 stats["errors"] += 1
                 return False
         decision = _decide(ex, video.text, filters)
+        if ch.get("discovered") and ex is not None and decision != "skipped" \
+                and ex.category not in discovery_cfg.get("allowed_categories", ["it"]):
+            decision = "skipped"  # 검색으로 찾은 영상은 관심 분야(IT 등)만
         if decision == "skipped":
             db.update_event(conn, video.url, status="skipped")
             stats["skipped"] += 1
