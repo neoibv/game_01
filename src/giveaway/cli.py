@@ -14,7 +14,7 @@ from . import approval, auth, db, digest, discover, state, winners
 from .collectors import community as community_mod
 from .collectors import sites as sites_mod
 from .collectors.youtube import YouTubeClient
-from .detect import detect, load_filters
+from .detect import detect, excluded_topic, load_filters
 from .extract import Extracted, Extractor
 from .rank import parse_deadline, score
 from .telegram_bot import Telegram
@@ -92,6 +92,8 @@ def collect_sites(conn, items: list, filters: dict, notify,
     entries: list[digest.SiteEntry] = []
     for item in items:
         if db.url_exists(conn, item.url) or db.title_exists(conn, item.title):
+            continue
+        if excluded_topic(item.text, filters):
             continue
         if len(entries) >= MAX_NOTIFY_PER_RUN:
             break
@@ -240,6 +242,18 @@ def apply_channel_defaults(ex: Extracted, ch: dict) -> Extracted:
     return ex
 
 
+def skip_excluded_existing(conn, filters: dict) -> int:
+    """이미 알림이 나간 이벤트 중 제외 분야(키보드 등)는 처리 대기를 끝낸다.
+    (텔레그램에 남은 [게시] 버튼은 '처리할 수 없는 상태'로 막혀 실수로 게시되지 않는다.)"""
+    n = 0
+    for row in conn.execute("SELECT source_url, title, raw_text, status FROM events WHERE status IN "
+                            "('notified', 'pending', 'awaiting_approval', 'awaiting_format')").fetchall():
+        if excluded_topic(f"{row['title']}\n{row['raw_text'] or ''}", filters):
+            db.update_event(conn, row["source_url"], status="skipped")
+            n += 1
+    return n
+
+
 def _gather_comments(yt, video_id: str, channel_id: str, both_orders: bool) -> tuple[str, list[str]]:
     """인기순 댓글. 응모 양식을 영상으로 안내하는 채널은 최신순도 합쳐서 새로 달리는 양식 댓글까지 본다."""
     pinned, others = yt.comments(video_id, channel_id)
@@ -346,6 +360,7 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
     확정 기준: 진행 중인 경품 이벤트이면서 (응모 링크가 있거나 여러 시청자가 같은 양식으로 댓글 참여).
     근거가 아직 없는 영상은 pending으로 두고 PENDING_HOURS 동안 다시 확인한다.
     tg가 있으면 확정된 댓글 이벤트에 한해 초안+승인 버튼을 추가로 보낸다."""
+    skip_excluded_existing(conn, filters)
     last_run = db.get_meta(conn, "last_collect_at")
     published_after = last_run or _iso(_now() - timedelta(days=LOOKBACK_FIRST_RUN_DAYS))
     stats = {"channels": 0, "videos": 0, "new": 0, "skipped": 0, "pending": 0, "errors": 0,
@@ -362,7 +377,8 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
         for row in db.pending_events(conn):
             url = row["source_url"]
             age = _now() - datetime.strptime(row["first_seen_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            if age > timedelta(hours=PENDING_HOURS) or not row["video_id"]:
+            if age > timedelta(hours=PENDING_HOURS) or not row["video_id"] \
+                    or excluded_topic(row["raw_text"] or "", filters):
                 db.update_event(conn, url, status="skipped")
                 continue
             try:
@@ -393,6 +409,9 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
         stats["videos"] += 1
         if len(confirmed) >= MAX_NOTIFY_PER_RUN:
             return True
+        if excluded_topic(f"{video.title}\n{video.description}", filters):
+            stats["excluded_topic"] = stats.get("excluded_topic", 0) + 1
+            return False  # 제외 분야(키보드 등): AI를 부르지 않는다
         fmt = bool(ch.get("format_in_video"))
         det = detect(video.text, filters)
         pinned, others = "", []
@@ -429,6 +448,8 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 stats["errors"] += 1
                 return False
         decision = _decide(ex, video.text, filters)
+        if ex is not None and excluded_topic(f"{ex.product} {ex.prize}", filters):
+            decision = "skipped"
         if ch.get("discovered") and ex is not None and decision != "skipped" \
                 and ex.category not in discovery_cfg.get("allowed_categories", ["it"]):
             decision = "skipped"  # 검색으로 찾은 영상은 관심 분야(IT 등)만
@@ -511,7 +532,7 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
         try:
             found = discover.run_discovery(
                 conn, yt, discovery_cfg, published_after=_iso(_now() - timedelta(days=discovery_cfg.get("lookback_days", 7))),
-                exclude_channel_ids=configured_ids | {c for c, _ in watched})
+                exclude_channel_ids=configured_ids | {c for c, _ in watched}, filters=filters)
         except Exception as e:  # noqa: BLE001 — 검색 실패(쿼터 등)가 기존 수집을 막지 않게
             print(f"발견 검색 실패: {e}", file=sys.stderr)
             stats["discovery_error"] = str(e)[:120]
