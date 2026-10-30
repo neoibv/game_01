@@ -19,6 +19,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   collect:
@@ -43,6 +44,8 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
       - if: always()
         run: scripts/state_save.sh
         env:

@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 import re
 import sys
 from dataclasses import dataclass, field
@@ -10,7 +11,7 @@ import json
 
 import yaml
 
-from . import approval, auth, db, digest, discover, state, winners
+from . import approval, auth, db, digest, discover, ghapi, state, winners
 from .collectors import community as community_mod
 from .collectors import sites as sites_mod
 from .collectors.youtube import YouTubeClient
@@ -566,17 +567,21 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                         approval.propose(conn, tg, extractor, eid, c.title, c.description, c.ex,
                                          manual=f"커뮤니티 게시글 댓글은 API로 작성할 수 없어요. 아래 초안을 복사해 "
                                                 f"게시글에 직접 달아주세요: {c.entry.url}")
+                        # 직접 작성용 초안은 버튼이 없어 감시가 필요 없다(stats에 세지 않음)
                 elif c.ch.get("format_in_video") and not c.ex.required_keywords:
                     # 양식이 영상에서만 안내되는 채널: 사용자가 영상 말미를 보고 양식을 알려주면 초안을 만든다
                     last = db.get_meta(conn, f"last_format:{c.entry.channel}") or c.ch.get("last_format", "")
                     approval.request_format(conn, tg, eid, c.title, c.entry.url, last)
-                else:
-                    approval.propose(conn, tg, extractor, eid, c.title, c.description, c.ex)
+                    stats["interactions"] = stats.get("interactions", 0) + 1
+                elif approval.propose(conn, tg, extractor, eid, c.title, c.description, c.ex) \
+                        and not c.ex.macro_banned:
+                    stats["interactions"] = stats.get("interactions", 0) + 1
             for vurl, v in video_events:
                 host_ch = next((c for c in channels if c["name"] == v.channel_name), {})
                 last = db.get_meta(conn, f"last_format:{v.channel_name}") or host_ch.get("last_format", "") \
                     or next((c.get("last_format", "") for c in channels if c.get("community")), "")
                 approval.request_format(conn, tg, db.event_id_by_url(conn, vurl), v.title, vurl, last)
+                stats["interactions"] = stats.get("interactions", 0) + 1
 
     if stats["unresolved"]:
         notify("⚠️ 채널을 찾지 못함: " + ", ".join(stats["unresolved"]))
@@ -646,6 +651,8 @@ def cmd_collect(args) -> None:
         db.set_meta(conn, "ai_error", extractor.last_error)
     elif extractor:
         db.set_meta(conn, "ai_error", "")
+    if stats.get("interactions"):  # 초안·양식 요청을 보냈으니 몇 시간 동안 버튼 응답을 바로 처리하도록 감시를 켠다
+        print("감시:", ghapi.ensure_watcher(300))
     print(stats, site_stats, remind_and_expire(conn, notify), win)
 
 
@@ -656,7 +663,41 @@ def cmd_poll(args) -> None:
     user = YouTubeUser(_env("YOUTUBE_CLIENT_ID"), _env("YOUTUBE_CLIENT_SECRET"),
                        _env("YOUTUBE_REFRESH_TOKEN"))
     key = os.environ.get("ANTHROPIC_API_KEY")
-    print("처리한 업데이트:", approval.poll(conn, tg, user, extractor=Extractor(key) if key else None))
+    handled = approval.poll(conn, tg, user, extractor=Extractor(key) if key else None)
+    print("처리한 업데이트:", handled)
+    if handled:  # 사용자가 지금 쓰는 중이니 다음 응답도 빨리 받도록 감시를 켠다
+        print("감시:", ghapi.ensure_watcher(180))
+
+
+def watch_loop(tg, *, minutes: float, dispatch, cooldown: int = 240, now=time.monotonic,
+               peek_timeout: int = 50) -> dict:
+    """처리 전 텔레그램 업데이트(버튼 클릭·답장)가 생기면 곧바로 poll 워크플로를 깨운다.
+    DB를 건드리지 않고 기다리기만 하므로 collect/poll과 충돌하지 않는다."""
+    deadline = now() + minutes * 60
+    last_dispatch = -cooldown
+    out = {"dispatched": 0, "peeks": 0, "acked": 0}
+    acked: set[str] = set()
+    while now() < deadline:
+        updates = tg.peek_updates(peek_timeout)
+        out["peeks"] += 1
+        mine = [u for u in updates if str(((u.get("callback_query") or {}).get("message") or u.get("message") or {})
+                                           .get("chat", {}).get("id")) == tg.chat_id]
+        for u in mine:  # 버튼의 로딩 표시를 바로 끈다(실제 처리는 poll이 수 초~1분 안에)
+            cb = u.get("callback_query")
+            if cb and cb["id"] not in acked:
+                acked.add(cb["id"])
+                tg.answer_callback(cb["id"], "접수됨 — 곧 처리됩니다")
+                out["acked"] += 1
+        if mine and now() - last_dispatch >= cooldown:
+            dispatch()
+            last_dispatch = now()
+            out["dispatched"] += 1
+    return out
+
+
+def cmd_watch(args) -> None:
+    tg = Telegram(_env("TELEGRAM_BOT_TOKEN"), _env("TELEGRAM_CHAT_ID"))
+    print(watch_loop(tg, minutes=args.minutes, dispatch=lambda: ghapi.dispatch("poll.yml")))
 
 
 def cmd_auth(args) -> None:
@@ -684,6 +725,9 @@ def main() -> None:
     pl.add_argument("--db", default="data/giveaways.db")
     pl.set_defaults(func=cmd_poll)
     sub.add_parser("auth").set_defaults(func=cmd_auth)
+    w = sub.add_parser("watch")
+    w.add_argument("--minutes", type=float, default=180)
+    w.set_defaults(func=cmd_watch)
     s = sub.add_parser("state")
     s.add_argument("action", choices=["encrypt", "decrypt"])
     s.add_argument("src")

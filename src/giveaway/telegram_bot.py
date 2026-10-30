@@ -32,8 +32,18 @@ class Telegram:
             payload["offset"] = offset
         return self._call("getUpdates", **payload)
 
+    def peek_updates(self, timeout: int = 50) -> list[dict]:
+        """offset 없이 롱폴링: 확인(ack)하지 않으므로 처리 전 업데이트가 그대로 남는다. 새 업데이트가 오면 즉시 반환."""
+        resp = self.http.post(f"{API}/bot{self.token}/getUpdates", timeout=timeout + 15,
+                              json={"timeout": timeout, "allowed_updates": ["message", "callback_query"]})
+        resp.raise_for_status()
+        return resp.json()["result"]
+
     def answer_callback(self, callback_id: str, text: str = "") -> None:
-        self._call("answerCallbackQuery", callback_query_id=callback_id, text=text[:200])
+        try:
+            self._call("answerCallbackQuery", callback_query_id=callback_id, text=text[:200])
+        except httpx.HTTPStatusError:
+            pass  # 이미 응답했거나 너무 오래된 버튼 — 처리 흐름을 막지 않는다
 
     def clear_buttons(self, message_id: int) -> None:
         self._call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=message_id,
