@@ -11,6 +11,7 @@ import json
 import yaml
 
 from . import approval, auth, db, digest, state, winners
+from .collectors import community as community_mod
 from .collectors import sites as sites_mod
 from .collectors.youtube import YouTubeClient
 from .detect import detect, load_filters
@@ -181,7 +182,8 @@ def _confirm(conn, url: str, ex: Extracted | None, *, title: str, channel: str, 
         requirements=json.dumps({"keywords": ex.required_keywords, "comment_prompt": ex.comment_prompt,
                                  "form_url": ex.form_url, "steps": ex.entry_steps,
                                  "entry_format": ex.entry_format, "format_confidence": ex.format_confidence,
-                                 "signup_condition": ex.signup_condition, "membership": ex.membership}, ensure_ascii=False),
+                                 "signup_condition": ex.signup_condition, "membership": ex.membership,
+                                 "min_lines": ex.comment_min_lines, "target": ex.comment_target}, ensure_ascii=False),
         macro_banned=int(ex.macro_banned), auto_enterable=int(ex.auto_enterable),
         deadline=ex.deadline, announce_at=ex.announce_at, announce_where=ex.announce_where,
         score=sc, video_id=video_id, channel_id=channel_id)
@@ -248,8 +250,83 @@ def _gather_comments(yt, video_id: str, channel_id: str, both_orders: bool) -> t
     return pinned, others
 
 
+TARGET_KO = {"post": "게시글(직접 작성)", "video": "연결 영상", "both": "게시글(직접 작성) + 연결 영상"}
+
+
+def collect_community(conn, yt, ch: dict, channel_id: str, extractor: Extractor, *, filters: dict,
+                      subscribe_channels: list[str], now: datetime | None = None, fetch=None) -> dict:
+    """채널 커뮤니티 게시물 → 이벤트. 게시물은 채널 주인의 공식 공지라 AI가 진행 중 이벤트로 본 것만 확정한다.
+    게시물에 링크된 영상은 별도 이벤트로 만들어(양식은 영상에서 안내) 사용자에게 양식을 묻는다."""
+    now = now or _now()
+    fetch = fetch or community_mod.fetch_posts
+    out = {"entries": [], "video_events": [], "posts": 0, "error": ""}
+    try:
+        posts = fetch(channel_id)
+    except Exception as e:  # noqa: BLE001 — 차단/구조 변경은 우회하지 않고 알린다
+        out["error"] = f"{type(e).__name__}: {str(e)[:100]}"
+        return out
+    if not posts:
+        out["error"] = "게시물 0건(페이지 구조 변경 또는 차단 의심)"
+        return out
+    max_age = ch.get("max_age_days", 14)
+    for post in posts:
+        out["posts"] += 1
+        if post.age_days is None or post.age_days > max_age or db.url_exists(conn, post.url):
+            continue
+        linked = []
+        for v in yt.videos(post.video_ids[:3]):
+            linked.append(v)
+        ctx = post.text + "".join(
+            f"\n\n[링크된 영상] {v.title}\n{v.description[:500]}" for v in linked)
+        published = (now - timedelta(days=post.age_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        title = post.text.strip().split("\n")[0][:60] or "(게시물)"
+        db.add_event(conn, source="youtube_post", source_url=post.url, title=title,
+                     host=ch["name"], matched=[], raw_text=post.text)
+        db.update_event(conn, post.url, channel_id=channel_id, published_at=published)
+        try:
+            ex = extractor.extract(ctx, title="[커뮤니티 게시물]", published_at=published,
+                                   today=now.date().isoformat(), kind="post")
+        except Exception as e:  # noqa: BLE001
+            print(f"extract 실패({post.url}), 다음 실행에서 재시도: {e}", file=sys.stderr)
+            db.delete_event(conn, post.url)
+            continue
+        ex.owner_announced = ex.is_giveaway  # 채널 주인의 공식 게시물
+        for m in ch.get("usual_methods", []):
+            if ex.is_giveaway and m not in ex.entry_methods and m != "comment":
+                ex.entry_methods.append(m)
+        if _decide(ex, post.text, filters, now) != "confirmed":
+            db.update_event(conn, post.url, status="skipped")
+            continue
+        if ex.comment_target in ("post", "both") and "comment" not in ex.entry_methods:
+            ex.entry_methods.append("comment")
+        entry = _confirm(conn, post.url, ex, title=f"[{ch['name']} 게시물] {title}", channel=ch["name"],
+                         text=post.text, tags=ch.get("tags", []), channel_id=channel_id, video_id="")
+        entry.target = TARGET_KO.get(ex.comment_target, "")
+        entry.linked = [f"{v.title} — {v.url}" for v in linked]
+        out["entries"].append(_Confirmed(entry, ex, title, post.text, ch=ch))
+        db.update_event(conn, post.url, video_id="")
+        if ex.comment_target in ("video", "both") and linked:
+            for v in linked:
+                vurl = v.url
+                if db.url_exists(conn, vurl):
+                    continue
+                db.add_event(conn, source="youtube", source_url=vurl, title=v.title,
+                             host=v.channel_name, matched=[], raw_text=v.text)
+                db.update_event(
+                    conn, vurl, video_id=v.video_id, channel_id=v.channel_id or channel_id,
+                    published_at=v.published_at, entry_methods=",".join(ex.entry_methods),
+                    deadline=ex.deadline,
+                    requirements=json.dumps({"steps": ex.entry_steps, "membership": ex.membership,
+                                             "subscribe_channels": subscribe_channels,
+                                             "from_post": post.url}, ensure_ascii=False),
+                    status="notified")
+                out["video_events"].append((vurl, v))
+    return out
+
+
 def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
-            notify, extractor: Extractor | None = None, tg: Telegram | None = None) -> dict:
+            notify, extractor: Extractor | None = None, tg: Telegram | None = None,
+            community_fetch=None) -> dict:
     """유튜브 이벤트를 한 메시지로 묶어 보낸다.
     확정 기준: 진행 중인 경품 이벤트이면서 (응모 링크가 있거나 여러 시청자가 같은 양식으로 댓글 참여).
     근거가 아직 없는 영상은 pending으로 두고 PENDING_HOURS 동안 다시 확인한다.
@@ -257,10 +334,13 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
     last_run = db.get_meta(conn, "last_collect_at")
     published_after = last_run or _iso(_now() - timedelta(days=LOOKBACK_FIRST_RUN_DAYS))
     stats = {"channels": 0, "videos": 0, "new": 0, "skipped": 0, "pending": 0, "errors": 0,
-             "unresolved": []}
+             "unresolved": [], "community_failed": []}
+    video_events: list[tuple] = []
     confirmed: list[_Confirmed] = []
     tags_by_name = {c["name"]: c.get("tags", []) for c in channels}
     channel_by_name = {c["name"]: c for c in channels}
+    community_ids = [m.split("|")[0] for c in channels if c.get("community")
+                     for m in [db.get_meta(conn, f"channel:{c['name']}")] if m]
 
     # 1) 이전에 근거가 부족했던 영상 재확인
     if extractor:
@@ -307,6 +387,18 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                    "다른 채널이면 알려주세요.")
         stats["channels"] += 1
 
+        if ch.get("community"):
+            # 이 채널은 커뮤니티 게시물과 거기 링크된 영상만 진짜 이벤트로 본다(일반 영상은 보지 않음).
+            if extractor is None:
+                continue
+            res = collect_community(conn, yt, ch, channel_id, extractor, filters=filters,
+                                    subscribe_channels=community_ids, fetch=community_fetch)
+            if res["error"]:
+                stats["community_failed"].append(f"{ch['name']}({res['error']})")
+            confirmed.extend(res["entries"])
+            video_events.extend(res["video_events"])
+            stats["new"] += len(res["entries"])
+            continue
         ids = yt.recent_video_ids(uploads, published_after)
         for video in yt.videos(ids, ch["name"]):
             stats["videos"] += 1
@@ -367,15 +459,31 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 if c.ex is None or not approval.proposable(c.ex):
                     continue
                 eid = db.event_id_by_url(conn, c.entry.url)
-                if c.ch.get("format_in_video") and not c.ex.required_keywords:
+                if c.entry.url.startswith("https://www.youtube.com/post/"):
+                    # 커뮤니티 게시글 댓글은 API로 작성할 수 없다 → 초안만 보내 사용자가 직접 단다
+                    if c.ex.comment_target in ("post", "both"):
+                        approval.propose(conn, tg, extractor, eid, c.title, c.description, c.ex,
+                                         manual=f"커뮤니티 게시글 댓글은 API로 작성할 수 없어요. 아래 초안을 복사해 "
+                                                f"게시글에 직접 달아주세요: {c.entry.url}")
+                elif c.ch.get("format_in_video") and not c.ex.required_keywords:
                     # 양식이 영상에서만 안내되는 채널: 사용자가 영상 말미를 보고 양식을 알려주면 초안을 만든다
                     last = db.get_meta(conn, f"last_format:{c.entry.channel}") or c.ch.get("last_format", "")
                     approval.request_format(conn, tg, eid, c.title, c.entry.url, last)
                 else:
                     approval.propose(conn, tg, extractor, eid, c.title, c.description, c.ex)
+            for vurl, v in video_events:
+                host_ch = next((c for c in channels if c["name"] == v.channel_name), {})
+                last = db.get_meta(conn, f"last_format:{v.channel_name}") or host_ch.get("last_format", "") \
+                    or next((c.get("last_format", "") for c in channels if c.get("community")), "")
+                approval.request_format(conn, tg, db.event_id_by_url(conn, vurl), v.title, vurl, last)
 
     if stats["unresolved"]:
         notify("⚠️ 채널을 찾지 못함: " + ", ".join(stats["unresolved"]))
+    failed_now = ",".join(stats["community_failed"])
+    if failed_now != (db.get_meta(conn, "community_failed") or ""):  # 같은 실패는 반복 알림 안 함
+        if failed_now:
+            notify("⚠️ 커뮤니티 탭 수집 실패: " + failed_now)
+        db.set_meta(conn, "community_failed", failed_now)
     db.set_meta(conn, "last_collect_at", _iso(_now()))
     return stats
 

@@ -34,6 +34,10 @@ SCHEMA = {
             "description": "해당 유튜브 채널의 유료 멤버십 가입이 조건인가. required=필수, optional=가입자 우대/권장, none=언급 없음. 채널 멤버십은 requires_purchase_or_signup이 아니라 이 필드로만 표시한다",
         },
         "comment_min_lines": {"type": "integer", "description": "댓글을 최소 몇 줄(줄바꿈 기준) 써야 하는지. 지정이 없으면 0"},
+        "comment_target": {
+            "type": "string", "enum": ["post", "video", "both", "unknown"],
+            "description": "댓글을 달아야 하는 곳. post=이 게시글/커뮤니티글, video=링크된 영상, both=둘 다(각각 별도 응모), unknown=일반 영상 설명란 등",
+        },
         "entry_format": {
             "type": "string",
             "description": "댓글/응모 양식 요약(예: '보겸으로 3행시', '사연 + 참여합니다'). 본문에 명시되어 있거나, 영상에서 안내하는 채널이면 시청자 댓글의 공통 양식에서 추정. 모르면 빈 문자열",
@@ -66,6 +70,20 @@ SYSTEM = (
 )
 
 
+_BLANKS = {'""', "''", "없음", "해당 없음", "해당없음", "미정", "미상", "n/a", "-", "null", "none"}
+_CLEAN_FIELDS = {"comment_prompt", "deadline", "announce_at", "announce_where", "entry_format",
+                 "signup_condition", "form_url"}
+
+
+def _clean(key: str, value):
+    """AI가 빈 값을 '""'나 '명시되지 않음' 같은 문구로 채우는 경우를 빈 문자열로 바로잡는다."""
+    if key in _CLEAN_FIELDS and isinstance(value, str):
+        v = value.strip()
+        if v.lower() in _BLANKS or "명시되지 않" in v or "언급되지 않" in v:
+            return ""
+    return value
+
+
 @dataclass
 class Extracted:
     is_giveaway: bool = False
@@ -81,6 +99,7 @@ class Extracted:
     signup_condition: str = ""
     membership: str = "none"
     comment_min_lines: int = 0
+    comment_target: str = "unknown"
     owner_announced: bool = False  # 코드가 설정: 채널 주인의 고정댓글/설명이 이벤트를 직접 알림
     entry_format: str = ""
     format_confidence: str = "none"
@@ -95,7 +114,7 @@ class Extracted:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Extracted":
-        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        known = {k: _clean(k, v) for k, v in d.items() if k in cls.__dataclass_fields__}
         return cls(**known)
 
     @property
@@ -152,12 +171,17 @@ class Extractor:
             self.errors += 1
             self.last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
             raise RuntimeError(self.last_error)
-        return resp.json()
+        data = resp.json()
+        if data.get("stop_reason") == "max_tokens":  # 생각(thinking)이 예산을 먹어 응답이 잘린 경우: 잘린 초안을 보내지 않는다
+            self.errors += 1
+            self.last_error = "응답이 max_tokens에서 잘림"
+            raise RuntimeError(self.last_error)
+        return data
 
     def parse_format(self, user_text: str) -> dict:
         """사용자가 영상을 보고 알려준 댓글 양식(자연어)을 구조화한다."""
         data = self._post({
-            "model": self.model, "max_tokens": 400,
+            "model": self.model, "max_tokens": 1500,
             "system": "사용자가 유튜브 이벤트의 댓글 응모 양식을 말로 설명한다. 말한 내용만 구조화하고 추측하지 않는다. record_format 도구로만 답한다.",
             "tools": [{"name": FORMAT_TOOL, "description": "댓글 양식 기록", "input_schema": FORMAT_SCHEMA}],
             "tool_choice": {"type": "tool", "name": FORMAT_TOOL},
@@ -169,8 +193,15 @@ class Extractor:
         raise ValueError("tool_use 블록이 응답에 없음")
 
     def extract(self, text: str, *, title: str, published_at: str, today: str,
-                comments: list[str] | None = None, format_in_video: bool = False) -> Extracted:
+                comments: list[str] | None = None, format_in_video: bool = False,
+                kind: str = "video") -> Extracted:
         comment_block = ""
+        if kind == "post":
+            comment_block += (
+                "\n\n[입력 종류] 유튜브 커뮤니티 게시물 본문이다. 채널 주인이 직접 쓴 공식 이벤트 공지이므로 응모 방법"
+                "(구독·좋아요·알람설정·댓글 양식·멤버십)과 댓글을 달아야 하는 위치(comment_target)를 본문에 적힌 그대로 추출한다. "
+                "'못 드렸습니다', '종료', '당첨자 발표' 같은 사후 공지나 채용 공고·일반 안내는 is_giveaway=false 또는 is_ended=true다. "
+                "본문 링크 영상에 댓글을 달라는 내용이 따로 있으면 comment_target은 both 또는 video다.")
         if format_in_video:
             comment_block += (
                 "\n\n[채널 특성] 이 채널은 응모 방법을 영상 말미(음성)에서 영상마다 다르게 안내하고, 그 내용은 설명란에 "
@@ -183,7 +214,7 @@ class Extractor:
             comment_block += f"\n\n--- 시청자 댓글 {min(len(comments), 40)}개 ---\n{lines}"
         data = self._post({
             "model": self.model,
-            "max_tokens": 1024,
+            "max_tokens": 4000,
             "system": SYSTEM,
             "tools": [{"name": TOOL_NAME, "description": "추출 결과 기록", "input_schema": SCHEMA}],
             "tool_choice": {"type": "tool", "name": TOOL_NAME},
@@ -213,7 +244,7 @@ def _draft_prompt(video_title: str, description: str, ex: "Extracted") -> str:
 
 
 def _draft_comment(self: "Extractor", video_title: str, description: str, ex: "Extracted") -> str:
-    data = self._post({"model": self.model, "max_tokens": 400, "system": DRAFT_SYSTEM,
+    data = self._post({"model": self.model, "max_tokens": 2000, "system": DRAFT_SYSTEM,
                        "messages": [{"role": "user", "content": _draft_prompt(video_title, description, ex)}]})
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
     if not text:

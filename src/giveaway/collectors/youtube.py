@@ -39,14 +39,15 @@ class YouTubeClient:
             if i["contentDetails"].get("videoPublishedAt", "") >= published_after
         ]
 
-    def videos(self, video_ids: list[str], channel_name: str) -> list[Video]:
+    def videos(self, video_ids: list[str], channel_name: str = "") -> list[Video]:
         out: list[Video] = []
         for i in range(0, len(video_ids), 50):
             data = self._get("videos", part="snippet", id=",".join(video_ids[i:i + 50]))
             for item in data.get("items", []):
                 s = item["snippet"]
-                out.append(Video(item["id"], channel_name, s["title"],
-                                 s.get("description", ""), s["publishedAt"]))
+                out.append(Video(item["id"], channel_name or s.get("channelTitle", ""), s["title"],
+                                 s.get("description", ""), s["publishedAt"],
+                                 channel_id=s.get("channelId", "")))
         return out
 
     def comments(self, video_id: str, channel_id: str, order: str = "relevance") -> tuple[str, list[str]]:

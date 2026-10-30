@@ -29,6 +29,12 @@ class YouTubeUser:
         resp.raise_for_status()
         return resp.json()["id"]
 
+    def update_comment(self, comment_id: str, text: str) -> None:
+        """내가 쓴 최상위 댓글 수정(우리 봇이 게시한 댓글처럼 ID를 아는 경우)."""
+        resp = self.http.put(f"{API}/comments", params={"part": "snippet"}, headers=self._headers(),
+                             json={"id": comment_id, "snippet": {"textOriginal": text}})
+        resp.raise_for_status()
+
     def subscribe(self, channel_id: str) -> bool:
         """이미 구독 중이면 False(정상)."""
         resp = self.http.post(f"{API}/subscriptions", params={"part": "snippet"},

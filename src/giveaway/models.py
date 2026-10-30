@@ -9,6 +9,7 @@ class Video:
     description: str
     published_at: str
     pinned_comment: str = ""
+    channel_id: str = ""
 
     @property
     def url(self) -> str:
