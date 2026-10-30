@@ -34,6 +34,10 @@ SCHEMA = {
             "description": "해당 유튜브 채널의 유료 멤버십 가입이 조건인가. required=필수, optional=가입자 우대/권장, none=언급 없음. 채널 멤버십은 requires_purchase_or_signup이 아니라 이 필드로만 표시한다",
         },
         "comment_min_lines": {"type": "integer", "description": "댓글을 최소 몇 줄(줄바꿈 기준) 써야 하는지. 지정이 없으면 0"},
+        "comment_target": {
+            "type": "string", "enum": ["post", "video", "both", "unknown"],
+            "description": "댓글을 달아야 하는 곳. post=이 게시글/커뮤니티글, video=링크된 영상, both=둘 다(각각 별도 응모), unknown=일반 영상 설명란 등",
+        },
         "entry_format": {
             "type": "string",
             "description": "댓글/응모 양식 요약(예: '보겸으로 3행시', '사연 + 참여합니다'). 본문에 명시되어 있거나, 영상에서 안내하는 채널이면 시청자 댓글의 공통 양식에서 추정. 모르면 빈 문자열",
@@ -81,6 +85,7 @@ class Extracted:
     signup_condition: str = ""
     membership: str = "none"
     comment_min_lines: int = 0
+    comment_target: str = "unknown"
     owner_announced: bool = False  # 코드가 설정: 채널 주인의 고정댓글/설명이 이벤트를 직접 알림
     entry_format: str = ""
     format_confidence: str = "none"
@@ -169,8 +174,15 @@ class Extractor:
         raise ValueError("tool_use 블록이 응답에 없음")
 
     def extract(self, text: str, *, title: str, published_at: str, today: str,
-                comments: list[str] | None = None, format_in_video: bool = False) -> Extracted:
+                comments: list[str] | None = None, format_in_video: bool = False,
+                kind: str = "video") -> Extracted:
         comment_block = ""
+        if kind == "post":
+            comment_block += (
+                "\n\n[입력 종류] 유튜브 커뮤니티 게시물 본문이다. 채널 주인이 직접 쓴 공식 이벤트 공지이므로 응모 방법"
+                "(구독·좋아요·알람설정·댓글 양식·멤버십)과 댓글을 달아야 하는 위치(comment_target)를 본문에 적힌 그대로 추출한다. "
+                "'못 드렸습니다', '종료', '당첨자 발표' 같은 사후 공지나 채용 공고·일반 안내는 is_giveaway=false 또는 is_ended=true다. "
+                "본문 링크 영상에 댓글을 달라는 내용이 따로 있으면 comment_target은 both 또는 video다.")
         if format_in_video:
             comment_block += (
                 "\n\n[채널 특성] 이 채널은 응모 방법을 영상 말미(음성)에서 영상마다 다르게 안내하고, 그 내용은 설명란에 "

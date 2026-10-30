@@ -1,11 +1,13 @@
 """댓글 초안을 만들어 텔레그램 승인 버튼과 함께 보내고, 버튼/답장 응답을 처리한다."""
+import json
+import re
 import time
 from datetime import datetime, timezone
 
 import httpx
 
 from . import db
-from .extract import Extracted, Extractor
+from .extract import Extracted, Extractor, fit_comment
 from .rank import parse_deadline
 
 
@@ -46,15 +48,19 @@ def _draft_message(title: str, text: str, notes: str = "", can_post: bool = True
 
 
 def propose(conn, tg, extractor: Extractor, event_id: int, title: str, description: str,
-            ex: Extracted) -> bool:
-    """초안 생성 실패 시 False(알림만 간 상태 유지)."""
+            ex: Extracted, manual: str = "") -> bool:
+    """초안 생성 실패 시 False(알림만 간 상태 유지). manual이 있으면 API로 게시할 수 없는 경우라
+    버튼 없이 초안만 보낸다(복사해서 직접 작성). 이 초안에 '검수 ...'로 답장하면 이미 쓴 댓글을 검토해 준다."""
     try:
         text = extractor.draft_comment(title, description, ex)
     except Exception:  # noqa: BLE001
         return False
     notes = _notes(ex)
-    if ex.macro_banned:  # 자동 게시하지 않고 초안만 보낸다
-        tg.send(_draft_message(title, text, notes, can_post=False))
+    if manual or ex.macro_banned:  # 자동 게시하지 않고 초안만 보낸다
+        notes = "\n".join(p for p in (manual, notes) if p)
+        msg_id = tg.send(_draft_message(title, text, notes, can_post=False)
+                         + "\n\n이미 직접 댓글을 쓰셨다면 이 메시지에 '검수' + 쓰신 댓글로 답장하세요. 양식을 확인해 드립니다.")
+        db.set_draft(conn, event_id, text, msg_id)
         return True
     msg_id = tg.send(_draft_message(title, text, notes), buttons=_buttons(event_id))
     db.set_draft(conn, event_id, text, msg_id)
@@ -110,14 +116,84 @@ def _handle_format_reply(conn, tg, extractor, event_id: int, text: str) -> None:
     except Exception as e:  # noqa: BLE001
         tg.send(f"양식을 해석하지 못했습니다({str(e)[:120]}). 다시 답장해 주세요.")
         return
-    ex = _ex_from_row(row, keywords=parsed.get("required_keywords", []),
-                      min_lines=int(parsed.get("comment_min_lines") or 0),
+    keywords = parsed.get("required_keywords", [])
+    min_lines = int(parsed.get("comment_min_lines") or 0)
+    req = json.loads(row["requirements"] or "{}")
+    req.update({"keywords": keywords, "min_lines": min_lines, "entry_format": parsed.get("entry_format", text)})
+    db.update_event(conn, row["source_url"], requirements=json.dumps(req, ensure_ascii=False))
+    ex = _ex_from_row(row, keywords=keywords, min_lines=min_lines,
                       entry_format=parsed.get("entry_format", text))
     if not propose(conn, tg, extractor, event_id, row["title"], row["raw_text"] or "", ex):
         tg.send("댓글 초안을 만들지 못했습니다. 잠시 후 양식을 다시 답장해 주세요.")
         db.update_event(conn, row["source_url"], status="awaiting_format")
         return
     db.set_meta(conn, f"last_format:{row['host']}", text)
+
+
+REVIEW_PREFIX = re.compile(r"^\s*(검수|확인|리뷰)\s*[:：]?\s*")
+
+
+def review_comment(comment: str, keywords: list[str], min_lines: int) -> dict:
+    """이미 쓴 댓글이 이벤트 양식(필수 키워드·최소 줄 수)에 맞는지 검토하고, 틀리면 수정안을 만든다."""
+    lines = [ln for ln in comment.split("\n") if ln.strip()]
+    missing = [k for k in keywords if k not in comment]
+    short = min_lines > 1 and len(lines) < min_lines
+    fixed = comment
+    if missing or short:
+        fixed = fit_comment(comment, Extracted(required_keywords=keywords, comment_min_lines=min_lines))
+    return {"ok": not (missing or short), "missing": missing, "lines": len(lines),
+            "min_lines": min_lines, "fixed": fixed.strip()}
+
+
+def _handle_review(conn, tg, event_id: int, comment: str) -> None:
+    row = db.get_event(conn, event_id)
+    if row is None:
+        return
+    req = json.loads(row["requirements"] or "{}")
+    keywords, min_lines = req.get("keywords", []), int(req.get("min_lines") or 0)
+    if not comment.strip():
+        tg.send("검수할 댓글을 '검수' 뒤에 붙여서 답장해 주세요.\n예) 검수\n보겸 선물 받고 싶어요\n아이폰듀오 가즈아")
+        return
+    if not keywords and min_lines <= 1:
+        tg.send("이 이벤트의 댓글 양식(필수 키워드·줄 수)을 아직 몰라 검수할 수 없어요. "
+                "영상 말미의 양식을 먼저 답장으로 알려주세요.")
+        return
+    res = review_comment(comment, keywords, min_lines)
+    rule = " · ".join(p for p in ("키워드 " + ", ".join(keywords) if keywords else "",
+                                  f"{min_lines}줄 이상" if min_lines > 1 else "") if p)
+    if res["ok"]:
+        tg.send(f"✅ 양식에 맞습니다 ({rule}) — {res['lines']}줄.\n※ 키워드·줄 수만 확인했어요. 같은 문구를 복사해 "
+                "여러 번 쓴 댓글은 자동 필터에 걸릴 수 있습니다.")
+        return
+    problems = []
+    if res["missing"]:
+        problems.append("빠진 키워드: " + ", ".join(res["missing"]))
+    if res["min_lines"] > 1 and res["lines"] < res["min_lines"]:
+        problems.append(f"줄 수 부족: {res['lines']}줄 (필요 {res['min_lines']}줄 이상)")
+    entry = conn.execute("SELECT payload FROM entries WHERE event_id = ? AND method = 'comment'",
+                         (event_id,)).fetchone()
+    buttons = None
+    note = "기존 댓글의 ⋮ → 수정에서 위 내용으로 바꿔 주세요(글을 지우고 새로 쓰면 중복 응모가 될 수 있어요)."
+    if entry:  # 봇이 게시한 댓글이면 버튼으로 바로 수정
+        db.set_meta(conn, f"fix_text:{event_id}", res["fixed"])
+        buttons = [("✏️ 수정 적용", f"fix:{event_id}")]
+        note = "봇이 올린 댓글이라 아래 버튼으로 바로 수정할 수 있어요."
+    tg.send(f"❌ 양식이 맞지 않아요 ({rule})\n- " + "\n- ".join(problems)
+            + f"\n\n수정 제안:\n{res['fixed']}\n\n{note}", buttons=buttons)
+
+
+def do_fix(conn, yt_user, event_id: int) -> str:
+    text = db.get_meta(conn, f"fix_text:{event_id}")
+    entry = conn.execute("SELECT payload FROM entries WHERE event_id = ? AND method = 'comment'",
+                         (event_id,)).fetchone()
+    if not text or not entry:
+        return "수정할 댓글 정보가 없습니다"
+    try:
+        yt_user.update_comment(entry["payload"], text)
+    except httpx.HTTPStatusError as e:
+        return f"❌ 수정 실패 ({e.response.status_code}): {e.response.text[:200]}"
+    db.set_draft(conn, event_id, text, None)
+    return "✅ 댓글을 수정했습니다"
 
 
 def _entry_methods(row) -> list[str]:
@@ -145,7 +221,10 @@ def do_post(conn, yt_user, event_id: int, now: datetime | None = None) -> str:
     done = []
     try:
         if "subscribe" in methods and row["channel_id"]:
-            done.append("구독" if yt_user.subscribe(row["channel_id"]) else "이미 구독 중")
+            req = json.loads(row["requirements"] or "{}")
+            targets = list(dict.fromkeys([row["channel_id"], *req.get("subscribe_channels", [])]))
+            results = [yt_user.subscribe(cid) for cid in targets]
+            done.append(f"구독 {len(targets)}개 채널" if any(results) else "이미 구독 중")
         if "like" in methods and row["video_id"]:
             yt_user.like(row["video_id"])
             done.append("좋아요")
@@ -183,6 +262,12 @@ def handle_update(conn, tg, yt_user, upd: dict, *, gap_state: dict, gap_seconds:
                 gap_state["posted"] = True
             if not result.startswith("❌"):
                 tg.clear_buttons(msg_id)
+        elif action == "fix":
+            result = do_fix(conn, yt_user, event_id)
+            tg.answer_callback(cb["id"], result.splitlines()[0])
+            tg.send(result)
+            if result.startswith("✅"):
+                tg.clear_buttons(msg_id)
         elif action == "skip":
             row = db.get_event(conn, event_id)
             if row and row["status"] in ("awaiting_approval", "awaiting_format"):
@@ -201,6 +286,12 @@ def handle_update(conn, tg, yt_user, upd: dict, *, gap_state: dict, gap_seconds:
     if not reply or not text:
         return
     format_event = db.get_meta(conn, f"format_req:{reply['message_id']}")
+    review = REVIEW_PREFIX.match(text)
+    if review:  # '검수 <내가 쓴 댓글>' — 초안/양식요청 메시지에 답장
+        target = int(format_event) if format_event else db.event_id_by_draft_message(conn, reply["message_id"])
+        if target is not None:
+            _handle_review(conn, tg, target, text[review.end():])
+            return
     if format_event:
         _handle_format_reply(conn, tg, extractor, int(format_event), text)
         return
@@ -209,7 +300,8 @@ def handle_update(conn, tg, yt_user, upd: dict, *, gap_state: dict, gap_seconds:
         return
     row = db.get_event(conn, event_id)
     if not row or row["status"] != "awaiting_approval":
-        tg.send("이미 처리된 이벤트라 수정할 수 없습니다")
+        tg.send("이 초안은 버튼 없이 직접 작성하는 용도거나 이미 처리된 이벤트예요. 이미 쓰신 댓글을 확인하려면 "
+                "'검수' 뒤에 댓글을 붙여 답장하세요.")
         return
     old = db.get_draft(conn, event_id)
     notes = db.get_meta(conn, f"draft_notes:{event_id}") or ""

@@ -219,7 +219,8 @@ def test_macro_banned_draft_has_no_buttons_and_no_pending_state(tmp_path):
     ex = Extracted(is_giveaway=True, entry_methods=["comment"], macro_banned=True)
     assert approval.propose(conn, tg, FakeExtractor(), eid, "리뷰", "설명", ex)
     assert tg.sent[0][2] is None and "직접 작성" in tg.sent[0][1]
-    assert db.get_event(conn, eid)["status"] == "notified" and db.get_draft(conn, eid) is None
+    assert db.get_event(conn, eid)["status"] == "notified"  # 게시 대기 상태가 아님
+    assert db.get_draft(conn, eid)["message_id"] == tg.sent[0][0]  # 검수 답장 라우팅용으로 초안은 저장
 
 
 # ---- 영상에서만 양식을 안내하는 채널: 사용자가 답장으로 알려주면 초안 생성 ----

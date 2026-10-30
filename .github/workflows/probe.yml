@@ -19,12 +19,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e .
-      - name: Restore state (read-only)
-        run: |
-          mkdir -p data
-          git fetch origin state --depth=1
-          git show FETCH_HEAD:giveaways.db.enc > data/giveaways.db.enc
-          giveaway state decrypt data/giveaways.db.enc data/giveaways.db
-        env:
-          STATE_KEY: ${{ secrets.STATE_KEY }}
       - run: python scripts/probe.py
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
