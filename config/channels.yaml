@@ -8,7 +8,12 @@ channels:
   - { name: 가전주부,    handle: "",         tags: [it] }
   - { name: 뻘짓연구소,  handle: "",         tags: [it] }
   - { name: 1분미만,     handle: "",         tags: [it] }
-  # format_in_video: 응모 방법을 영상 말미(음성)에서 영상마다 다르게 안내하는 채널.
-  # 자막은 YouTube가 GitHub 서버 IP를 막아 받을 수 없어, 설명/고정댓글과 시청자 댓글의 공통 양식으로 추정한다.
-  - { name: 보겸TV,      handle: "",         tags: [entertainment], format_in_video: true }
-  - { name: 보겸S,       handle: "",         tags: [entertainment], format_in_video: true }
+  # --- 영상 말미(음성)에서 응모 방법을 영상마다 다르게 안내하는 채널 ---
+  # format_in_video: true   키워드가 없어도 새 영상을 분석하고, 양식은 사용자가 영상을 보고 텔레그램으로 답장해 알려준다.
+  #                          (자막은 YouTube가 GitHub 서버 IP를 막아 받을 수 없다.)
+  # usual_methods/steps     이 채널 이벤트의 통상 조건. 영상에서만 안내돼 텍스트로 못 읽을 때 보충한다(알림 설정은 안내만).
+  # last_format             직전 이벤트의 댓글 양식. 새 이벤트 때 '같음'이라고 답장하면 재사용한다.
+  # max_age_days            마감일을 모를 때 게시 후 이 기간이 지나면 종료로 본다.
+  # 멤버십 가입 여부는 영상마다 달라 알림에서 영상 확인을 안내한다.
+  - { name: 보겸TV,      handle: "",         tags: [entertainment], format_in_video: true, usual_methods: [subscribe, like, comment], usual_steps: ["구독", "좋아요", "알림 설정", "댓글(영상 말미 안내 양식)"], max_age_days: 14, last_format: "보겸·아이폰듀오 두 키워드 포함, 2줄 이상 (2026-09 아이폰 이벤트)" }
+  - { name: 보겸S,       handle: "",         tags: [entertainment], format_in_video: true, usual_methods: [subscribe, like, comment], usual_steps: ["구독", "좋아요", "알림 설정", "댓글(영상 말미 안내 양식)"], max_age_days: 14, last_format: "보겸·아이폰듀오 두 키워드 포함, 2줄 이상 (2026-09 아이폰 이벤트)" }

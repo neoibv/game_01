@@ -28,6 +28,11 @@ def _notes(ex: Extracted) -> str:
     if manual:
         lines.append("📝 댓글 외에 직접 해야 할 것: " + (" → ".join(ex.entry_steps) if ex.entry_steps else ", ".join(manual))
                      + (f"\n   {ex.form_url}" if ex.form_url else ""))
+    if ex.membership != "none":
+        lines.append("💳 채널 멤버십(유료) " + ("가입이 필수 조건입니다" if ex.membership == "required" else "가입이 우대/권장 조건입니다")
+                     + " — 자동 처리하지 않으니 원하면 직접 가입하세요.")
+    if "알림" in " ".join(ex.entry_steps):
+        lines.append("🔔 알림 설정(종 아이콘)은 API로 못 해서 직접 해야 합니다.")
     if ex.macro_banned:
         lines.append("🚫 자동 응모 금지 문구가 있어 [게시] 버튼을 달지 않았습니다. 위 내용을 복사해 직접 작성하세요.")
     if {"subscribe", "like"} & set(ex.entry_methods) and not ex.macro_banned:
@@ -57,6 +62,62 @@ def propose(conn, tg, extractor: Extractor, event_id: int, title: str, descripti
     row = db.get_event(conn, event_id)
     db.update_event(conn, row["source_url"], status="awaiting_approval")
     return True
+
+
+SAME_AS_LAST = {"같음", "동일", "같아", "같아요", "same", "그대로"}
+
+
+def request_format(conn, tg, event_id: int, title: str, url: str, last_format: str = "") -> int:
+    """응모 양식을 영상에서만 안내하는 채널: 사용자가 영상 말미를 보고 답장으로 알려주면 초안을 만든다."""
+    lines = [f"🎬 {title}",
+             "이 채널은 댓글 응모 양식을 영상 말미에서 말로 안내합니다. 영상 끝부분을 확인하고 "
+             "이 메시지에 **답장**으로 양식을 알려주세요.",
+             "예) 보겸, 아이폰듀오 두 키워드 포함 2줄 이상"]
+    if last_format:
+        lines.append(f"지난번 양식: {last_format}\n(같으면 '같음'이라고 답장)")
+    lines.append(url)
+    msg_id = tg.send("\n\n".join(lines), buttons=[("⏭ 건너뛰기", f"skip:{event_id}")])
+    db.set_meta(conn, f"format_req:{msg_id}", str(event_id))
+    row = db.get_event(conn, event_id)
+    db.update_event(conn, row["source_url"], status="awaiting_format")
+    return msg_id
+
+
+def _ex_from_row(row, *, keywords: list[str], min_lines: int, entry_format: str) -> Extracted:
+    import json
+    req = json.loads(row["requirements"] or "{}")
+    return Extracted(
+        is_giveaway=True, entry_methods=_entry_methods(row), entry_steps=req.get("steps", []),
+        form_url=req.get("form_url", ""), comment_prompt=req.get("comment_prompt", ""),
+        required_keywords=keywords, comment_min_lines=min_lines, entry_format=entry_format,
+        format_confidence="high", macro_banned=bool(row["macro_banned"]),
+        membership=req.get("membership", "none"), deadline=row["deadline"] or "")
+
+
+def _handle_format_reply(conn, tg, extractor, event_id: int, text: str) -> None:
+    row = db.get_event(conn, event_id)
+    if not row or row["status"] != "awaiting_format":
+        tg.send("이미 처리된 이벤트라 양식을 받을 수 없습니다")
+        return
+    if extractor is None:
+        tg.send("AI 키(ANTHROPIC_API_KEY)가 poll 워크플로에 없어 양식을 해석하지 못했습니다.")
+        return
+    last = db.get_meta(conn, f"last_format:{row['host']}") or ""
+    if text.strip().lower() in SAME_AS_LAST and last:
+        text = last
+    try:
+        parsed = extractor.parse_format(text)
+    except Exception as e:  # noqa: BLE001
+        tg.send(f"양식을 해석하지 못했습니다({str(e)[:120]}). 다시 답장해 주세요.")
+        return
+    ex = _ex_from_row(row, keywords=parsed.get("required_keywords", []),
+                      min_lines=int(parsed.get("comment_min_lines") or 0),
+                      entry_format=parsed.get("entry_format", text))
+    if not propose(conn, tg, extractor, event_id, row["title"], row["raw_text"] or "", ex):
+        tg.send("댓글 초안을 만들지 못했습니다. 잠시 후 양식을 다시 답장해 주세요.")
+        db.update_event(conn, row["source_url"], status="awaiting_format")
+        return
+    db.set_meta(conn, f"last_format:{row['host']}", text)
 
 
 def _entry_methods(row) -> list[str]:
@@ -101,7 +162,7 @@ def do_post(conn, yt_user, event_id: int, now: datetime | None = None) -> str:
 
 
 def handle_update(conn, tg, yt_user, upd: dict, *, gap_state: dict, gap_seconds: float = 120,
-                  sleep=time.sleep) -> None:
+                  sleep=time.sleep, extractor=None) -> None:
     cb = upd.get("callback_query")
     if cb:
         if str(cb["message"]["chat"]["id"]) != tg.chat_id:
@@ -124,7 +185,7 @@ def handle_update(conn, tg, yt_user, upd: dict, *, gap_state: dict, gap_seconds:
                 tg.clear_buttons(msg_id)
         elif action == "skip":
             row = db.get_event(conn, event_id)
-            if row and row["status"] == "awaiting_approval":
+            if row and row["status"] in ("awaiting_approval", "awaiting_format"):
                 db.update_event(conn, row["source_url"], status="skipped")
             tg.answer_callback(cb["id"], "건너뜀")
             tg.clear_buttons(msg_id)
@@ -138,6 +199,10 @@ def handle_update(conn, tg, yt_user, upd: dict, *, gap_state: dict, gap_seconds:
     reply = msg.get("reply_to_message")
     text = (msg.get("text") or "").strip()
     if not reply or not text:
+        return
+    format_event = db.get_meta(conn, f"format_req:{reply['message_id']}")
+    if format_event:
+        _handle_format_reply(conn, tg, extractor, int(format_event), text)
         return
     event_id = db.event_id_by_draft_message(conn, reply["message_id"])
     if event_id is None:

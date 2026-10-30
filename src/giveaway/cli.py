@@ -2,7 +2,7 @@ import argparse
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,6 +22,9 @@ ROOT = Path(__file__).resolve().parents[2]
 LOOKBACK_FIRST_RUN_DAYS = 30
 MAX_NOTIFY_PER_RUN = 20
 PENDING_HOURS = 72  # 응모 근거가 아직 없는 영상을 다시 확인해 주는 기간
+# 채널 주인의 고정댓글/설명이 응모를 직접 안내하는지(영상에서 양식을 말로 안내하는 채널용)
+OWNER_EVENT_HINT = re.compile(r"응모\s*양식|응모\s*방법|응모\s*조건|참여\s*방법|참여\s*양식|당첨.{0,6}취소")
+OWNER_ENDED_HINT = re.compile(r"당첨자\s*(발표|안내)|이벤트\s*(종료|마감)")
 EXTERNAL_LINK = re.compile(r"https?://(?!(?:www\.|m\.)?(?:youtube\.com|youtu\.be))[^\s)]+")
 SOURCE_TAGS = {"danawa": ["it"]}  # 다나와 이벤트는 IT/가전 위주
 
@@ -156,10 +159,11 @@ class _Confirmed:
     title: str
     description: str
     from_pending: bool = False
+    ch: dict = field(default_factory=dict)
 
 
 def _confirm(conn, url: str, ex: Extracted | None, *, title: str, channel: str, text: str,
-             tags: list[str], channel_id: str, video_id: str) -> digest.YtEntry:
+             tags: list[str], channel_id: str, video_id: str, video_check: bool = False) -> digest.YtEntry:
     link = ""
     if ex is None:
         m = EXTERNAL_LINK.search(text)
@@ -177,15 +181,60 @@ def _confirm(conn, url: str, ex: Extracted | None, *, title: str, channel: str, 
         requirements=json.dumps({"keywords": ex.required_keywords, "comment_prompt": ex.comment_prompt,
                                  "form_url": ex.form_url, "steps": ex.entry_steps,
                                  "entry_format": ex.entry_format, "format_confidence": ex.format_confidence,
-                                 "signup_condition": ex.signup_condition}, ensure_ascii=False),
+                                 "signup_condition": ex.signup_condition, "membership": ex.membership}, ensure_ascii=False),
         macro_banned=int(ex.macro_banned), auto_enterable=int(ex.auto_enterable),
         deadline=ex.deadline, announce_at=ex.announce_at, announce_where=ex.announce_where,
         score=sc, video_id=video_id, channel_id=channel_id)
+    rule = []
+    if ex.required_keywords:
+        rule.append("키워드 " + ", ".join(ex.required_keywords) + " 포함")
+    if ex.comment_min_lines > 1:
+        rule.append(f"{ex.comment_min_lines}줄 이상")
+    if ex.comment_prompt:
+        rule.append(ex.comment_prompt)
     return digest.YtEntry(
         channel=channel, title=title, product=product, deadline=ex.deadline, url=url,
         apply_link=ex.form_url, score=sc, steps=ex.entry_steps, entry_format=ex.entry_format,
-        format_inferred=ex.format_confidence == "low",
+        format_inferred=ex.format_confidence == "low", comment_rule=" · ".join(rule),
+        video_check=bool(video_check),
+        membership={"required": "필수 (유료)", "optional": "우대/권장 (유료)"}.get(ex.membership, ""),
         condition=ex.signup_condition if ex.requires_purchase_or_signup else "")
+
+
+def analyze_video(extractor: Extractor, *, text: str, title: str, published_at: str, pinned: str,
+                  comments: list[str], ch: dict, now: datetime | None = None) -> Extracted:
+    """AI 추출 + 채널별 보정. 영상에서 양식을 안내하는 채널은 주인의 고정댓글을 이벤트 근거로 인정하고,
+    마감일을 모르면 게시 후 max_age_days(기본 14일)가 지난 영상은 종료로 본다."""
+    now = now or _now()
+    fmt = bool(ch.get("format_in_video"))
+    ex = extractor.extract(text, title=title, published_at=published_at, today=now.date().isoformat(),
+                           comments=comments, format_in_video=fmt)
+    if fmt:
+        if OWNER_EVENT_HINT.search(pinned or "") and not OWNER_ENDED_HINT.search(pinned or "") \
+                and not ex.is_ended:
+            ex.is_giveaway = True
+            ex.owner_announced = True
+        if ex.is_giveaway:
+            apply_channel_defaults(ex, ch)
+            if not ex.deadline and published_at:
+                try:
+                    pub = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    if now - pub > timedelta(days=ch.get("max_age_days", 14)):
+                        ex.is_ended = True
+                except ValueError:
+                    pass
+    return ex
+
+
+def apply_channel_defaults(ex: Extracted, ch: dict) -> Extracted:
+    """채널별 통상 조건(config의 usual_methods/usual_steps)을 AI가 못 찾은 경우 보충한다.
+    영상 말미에서만 안내하는 채널의 구독·좋아요·알림설정처럼 텍스트에 없는 관례용."""
+    for m in ch.get("usual_methods", []):
+        if m not in ex.entry_methods:
+            ex.entry_methods.append(m)
+    steps = [st for st in ch.get("usual_steps", []) if not any(st[:2] in s for s in ex.entry_steps)]
+    ex.entry_steps = steps + ex.entry_steps
+    return ex
 
 
 def _gather_comments(yt, video_id: str, channel_id: str, both_orders: bool) -> tuple[str, list[str]]:
@@ -211,7 +260,7 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
              "unresolved": []}
     confirmed: list[_Confirmed] = []
     tags_by_name = {c["name"]: c.get("tags", []) for c in channels}
-    format_by_name = {c["name"]: bool(c.get("format_in_video")) for c in channels}
+    channel_by_name = {c["name"]: c for c in channels}
 
     # 1) 이전에 근거가 부족했던 영상 재확인
     if extractor:
@@ -222,11 +271,12 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 db.update_event(conn, url, status="skipped")
                 continue
             try:
-                fmt = format_by_name.get(row["host"], False)
-                _, others = _gather_comments(yt, row["video_id"], row["channel_id"], fmt)
-                ex = extractor.extract(row["raw_text"], title=row["title"], published_at="",
-                                       today=_now().date().isoformat(), comments=others,
-                                       format_in_video=fmt)
+                chc = channel_by_name.get(row["host"], {})
+                pinned, others = _gather_comments(yt, row["video_id"], row["channel_id"],
+                                                  bool(chc.get("format_in_video")))
+                ex = analyze_video(extractor, text=row["raw_text"], title=row["title"],
+                                   published_at=row["published_at"] or "", pinned=pinned,
+                                   comments=others, ch=chc)
             except Exception as e:  # noqa: BLE001
                 print(f"보류 건 재확인 실패({url}): {e}", file=sys.stderr)
                 continue
@@ -236,8 +286,9 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
             elif decision == "confirmed" and len(confirmed) < MAX_NOTIFY_PER_RUN:
                 entry = _confirm(conn, url, ex, title=row["title"], channel=row["host"],
                                  text=row["raw_text"], tags=tags_by_name.get(row["host"], []),
-                                 channel_id=row["channel_id"], video_id=row["video_id"])
-                confirmed.append(_Confirmed(entry, ex, row["title"], row["raw_text"], True))
+                                 channel_id=row["channel_id"], video_id=row["video_id"],
+                                 video_check=chc.get("format_in_video"))
+                confirmed.append(_Confirmed(entry, ex, row["title"], row["raw_text"], True, chc))
                 stats["new"] += 1
 
     # 2) 새 영상
@@ -280,13 +331,13 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 det = detect(video.text, filters)  # 고정댓글까지 포함해 다시 키워드 확인
             db.add_event(conn, source="youtube", source_url=video.url, title=video.title,
                          host=video.channel_name, matched=det.matched, raw_text=video.text)
-            db.update_event(conn, video.url, video_id=video.video_id, channel_id=channel_id)
+            db.update_event(conn, video.url, video_id=video.video_id, channel_id=channel_id,
+                            published_at=video.published_at)
             ex = None
             if extractor:
                 try:
-                    ex = extractor.extract(video.text, title=video.title, published_at=video.published_at,
-                                           today=_now().date().isoformat(), comments=others,
-                                           format_in_video=fmt)
+                    ex = analyze_video(extractor, text=video.text, title=video.title,
+                                       published_at=video.published_at, pinned=pinned, comments=others, ch=ch)
                 except Exception as e:  # noqa: BLE001 — 지우고 다음 실행에서 재시도
                     print(f"extract 실패({video.url}), 다음 실행에서 재시도: {e}", file=sys.stderr)
                     db.delete_event(conn, video.url)
@@ -302,8 +353,8 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
             else:
                 entry = _confirm(conn, video.url, ex, title=video.title, channel=video.channel_name,
                                  text=video.text, tags=ch.get("tags", []), channel_id=channel_id,
-                                 video_id=video.video_id)
-                confirmed.append(_Confirmed(entry, ex, video.title, video.description))
+                                 video_id=video.video_id, video_check=ch.get("format_in_video"))
+                confirmed.append(_Confirmed(entry, ex, video.title, video.description, ch=ch))
                 stats["new"] += 1
 
     # 3) 묶음 전송 후 승인 요청
@@ -313,9 +364,15 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                        keep_pending={c.entry.url for c in confirmed if c.from_pending})
         if tg and extractor:
             for c in confirmed:
-                if c.ex is not None and approval.proposable(c.ex):
-                    approval.propose(conn, tg, extractor, db.event_id_by_url(conn, c.entry.url),
-                                     c.title, c.description, c.ex)
+                if c.ex is None or not approval.proposable(c.ex):
+                    continue
+                eid = db.event_id_by_url(conn, c.entry.url)
+                if c.ch.get("format_in_video") and not c.ex.required_keywords:
+                    # 양식이 영상에서만 안내되는 채널: 사용자가 영상 말미를 보고 양식을 알려주면 초안을 만든다
+                    last = db.get_meta(conn, f"last_format:{c.entry.channel}") or c.ch.get("last_format", "")
+                    approval.request_format(conn, tg, eid, c.title, c.entry.url, last)
+                else:
+                    approval.propose(conn, tg, extractor, eid, c.title, c.description, c.ex)
 
     if stats["unresolved"]:
         notify("⚠️ 채널을 찾지 못함: " + ", ".join(stats["unresolved"]))
@@ -387,7 +444,8 @@ def cmd_poll(args) -> None:
     conn = db.connect(Path(args.db))
     user = YouTubeUser(_env("YOUTUBE_CLIENT_ID"), _env("YOUTUBE_CLIENT_SECRET"),
                        _env("YOUTUBE_REFRESH_TOKEN"))
-    print("처리한 업데이트:", approval.poll(conn, tg, user))
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    print("처리한 업데이트:", approval.poll(conn, tg, user, extractor=Extractor(key) if key else None))
 
 
 def cmd_auth(args) -> None:
