@@ -45,6 +45,13 @@ for name in ("보겸TV", "보겸S"):
     posts = []
     walk(data, "backstagePostRenderer", posts)
     print("게시물 수:", len(posts))
+    print("키:", sorted(posts[0].keys()) if posts else None)
+    for p in posts[:3]:
+        print("postId:", p.get("postId"), "| attachment keys:", list((p.get("backstageAttachment") or {}).keys()),
+              "| navigationEndpoint:", json.dumps(p.get("navigationEndpoint", {}), ensure_ascii=False)[:300])
+        print("전체 본문:", "".join(x.get("text", "") for x in (p.get("contentText") or {}).get("runs", []))[:1500].replace("\n", " / "))
+        print("runs 개수:", len((p.get("contentText") or {}).get("runs", [])), "| 샘플 run:",
+              json.dumps(next((x for x in (p.get("contentText") or {}).get("runs", []) if "navigationEndpoint" in x), {}), ensure_ascii=False)[:400])
     for p in posts[:8]:
         runs = (p.get("contentText") or {}).get("runs", [])
         text = "".join(x.get("text", "") for x in runs).replace("\n", " / ")
