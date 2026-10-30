@@ -10,5 +10,6 @@ channels:
   - { name: 1분미만,     handle: "",         tags: [it] }
   # format_in_video: 응모 방법을 영상 말미(음성)에서 영상마다 다르게 안내하는 채널.
   # 자막은 YouTube가 GitHub 서버 IP를 막아 받을 수 없어, 설명/고정댓글과 시청자 댓글의 공통 양식으로 추정한다.
-  - { name: 보겸TV,      handle: "",         tags: [entertainment], format_in_video: true }
-  - { name: 보겸S,       handle: "",         tags: [entertainment], format_in_video: true }
+  # usual_*: 이 채널 이벤트의 통상 조건. 영상에서만 안내돼 텍스트로 못 읽을 때 보충한다(알림설정은 자동화 불가, 안내만).
+  - { name: 보겸TV,      handle: "",         tags: [entertainment], format_in_video: true, usual_methods: [subscribe, like], usual_steps: ["구독", "좋아요", "알림 설정"] }
+  - { name: 보겸S,       handle: "",         tags: [entertainment], format_in_video: true, usual_methods: [subscribe, like], usual_steps: ["구독", "좋아요", "알림 설정"] }

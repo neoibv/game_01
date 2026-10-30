@@ -181,11 +181,30 @@ def _confirm(conn, url: str, ex: Extracted | None, *, title: str, channel: str, 
         macro_banned=int(ex.macro_banned), auto_enterable=int(ex.auto_enterable),
         deadline=ex.deadline, announce_at=ex.announce_at, announce_where=ex.announce_where,
         score=sc, video_id=video_id, channel_id=channel_id)
+    rule = []
+    if ex.required_keywords:
+        rule.append("키워드 " + ", ".join(ex.required_keywords) + " 포함")
+    if ex.comment_min_lines > 1:
+        rule.append(f"{ex.comment_min_lines}줄 이상")
+    if ex.comment_prompt:
+        rule.append(ex.comment_prompt)
     return digest.YtEntry(
         channel=channel, title=title, product=product, deadline=ex.deadline, url=url,
         apply_link=ex.form_url, score=sc, steps=ex.entry_steps, entry_format=ex.entry_format,
-        format_inferred=ex.format_confidence == "low",
+        format_inferred=ex.format_confidence == "low", comment_rule=" · ".join(rule),
+        membership={"required": "필수 (유료)", "optional": "우대/권장 (유료)"}.get(ex.membership, ""),
         condition=ex.signup_condition if ex.requires_purchase_or_signup else "")
+
+
+def apply_channel_defaults(ex: Extracted, ch: dict) -> Extracted:
+    """채널별 통상 조건(config의 usual_methods/usual_steps)을 AI가 못 찾은 경우 보충한다.
+    영상 말미에서만 안내하는 채널의 구독·좋아요·알림설정처럼 텍스트에 없는 관례용."""
+    for m in ch.get("usual_methods", []):
+        if m not in ex.entry_methods:
+            ex.entry_methods.append(m)
+    steps = [st for st in ch.get("usual_steps", []) if not any(st[:2] in s for s in ex.entry_steps)]
+    ex.entry_steps = steps + ex.entry_steps
+    return ex
 
 
 def _gather_comments(yt, video_id: str, channel_id: str, both_orders: bool) -> tuple[str, list[str]]:
@@ -212,6 +231,7 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
     confirmed: list[_Confirmed] = []
     tags_by_name = {c["name"]: c.get("tags", []) for c in channels}
     format_by_name = {c["name"]: bool(c.get("format_in_video")) for c in channels}
+    channel_by_name = {c["name"]: c for c in channels}
 
     # 1) 이전에 근거가 부족했던 영상 재확인
     if extractor:
@@ -227,6 +247,8 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                 ex = extractor.extract(row["raw_text"], title=row["title"], published_at="",
                                        today=_now().date().isoformat(), comments=others,
                                        format_in_video=fmt)
+                if fmt and ex.is_giveaway:
+                    apply_channel_defaults(ex, channel_by_name.get(row["host"], {}))
             except Exception as e:  # noqa: BLE001
                 print(f"보류 건 재확인 실패({url}): {e}", file=sys.stderr)
                 continue
@@ -287,6 +309,8 @@ def collect(conn, yt: YouTubeClient, channels: list[dict], filters: dict,
                     ex = extractor.extract(video.text, title=video.title, published_at=video.published_at,
                                            today=_now().date().isoformat(), comments=others,
                                            format_in_video=fmt)
+                    if fmt and ex.is_giveaway:
+                        apply_channel_defaults(ex, ch)
                 except Exception as e:  # noqa: BLE001 — 지우고 다음 실행에서 재시도
                     print(f"extract 실패({video.url}), 다음 실행에서 재시도: {e}", file=sys.stderr)
                     db.delete_event(conn, video.url)

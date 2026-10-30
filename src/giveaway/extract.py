@@ -1,4 +1,5 @@
 """설명란/댓글 텍스트에서 경품 이벤트 정보를 구조화한다 (Claude tool use)."""
+import re
 from dataclasses import dataclass, field
 
 import httpx
@@ -28,6 +29,11 @@ SCHEMA = {
             "description": "응모에 외부 서비스 회원가입, 상품 구매, 앱 설치, 통신사 가입·개통, 유료 결제 같은 조건이 있는가. 채널 구독·좋아요·댓글·구글폼 작성은 해당 없음",
         },
         "signup_condition": {"type": "string", "description": "위 조건의 내용 한 줄. 없으면 빈 문자열"},
+        "membership": {
+            "type": "string", "enum": ["none", "optional", "required"],
+            "description": "해당 유튜브 채널의 유료 멤버십 가입이 조건인가. required=필수, optional=가입자 우대/권장, none=언급 없음. 채널 멤버십은 requires_purchase_or_signup이 아니라 이 필드로만 표시한다",
+        },
+        "comment_min_lines": {"type": "integer", "description": "댓글을 최소 몇 줄(줄바꿈 기준) 써야 하는지. 지정이 없으면 0"},
         "entry_format": {
             "type": "string",
             "description": "댓글/응모 양식 요약(예: '보겸으로 3행시', '사연 + 참여합니다'). 본문에 명시되어 있거나, 영상에서 안내하는 채널이면 시청자 댓글의 공통 양식에서 추정. 모르면 빈 문자열",
@@ -73,6 +79,8 @@ class Extracted:
     entry_steps: list[str] = field(default_factory=list)
     requires_purchase_or_signup: bool = False
     signup_condition: str = ""
+    membership: str = "none"
+    comment_min_lines: int = 0
     entry_format: str = ""
     format_confidence: str = "none"
     many_similar_entries: bool = False
@@ -106,6 +114,13 @@ class Extracted:
                 and not self.needs_login_or_captcha)
 
 
+def _comment_line(comment: str) -> str:
+    """줄바꿈은 양식(몇 줄 이상 등) 판단 단서라 ⏎로 보존하고 줄 수를 앞에 붙인다."""
+    parts = [p.strip() for p in comment.strip().split("\n") if p.strip()]
+    prefix = f"[{len(parts)}줄] " if len(parts) >= 2 else ""
+    return f"- {prefix}{' ⏎ '.join(parts)[:200]}"
+
+
 class Extractor:
     def __init__(self, api_key: str, client: httpx.Client | None = None, model: str = MODEL):
         self.api_key = api_key
@@ -134,7 +149,7 @@ class Extractor:
                 "같은 양식(예: '보겸으로 N행시', '사연+참여합니다')을 따르면 진행 중인 이벤트로 본다. 그 경우 댓글들의 공통 "
                 "양식을 entry_format에 요약하고 format_confidence는 low로 한다. 일반 감상·응원 댓글뿐이면 이벤트가 아니다.")
         if comments:
-            lines = "\n".join(f"- {c[:160]}" for c in comments[:40])
+            lines = "\n".join(_comment_line(c) for c in comments[:40])
             comment_block += f"\n\n--- 시청자 댓글 {min(len(comments), 40)}개 ---\n{lines}"
         data = self._post({
             "model": self.model,
@@ -163,6 +178,7 @@ DRAFT_SYSTEM = (
 def _draft_prompt(video_title: str, description: str, ex: "Extracted") -> str:
     return (f"영상 제목: {video_title}\n이벤트 댓글 주제: {ex.comment_prompt or '(지정 없음 — 영상 감상 한마디)'}\n"
             f"댓글 양식: {ex.entry_format or '(지정 없음)'}\n"
+            f"최소 줄 수: {ex.comment_min_lines or '(지정 없음)'} (줄바꿈으로 구분)\n"
             f"필수 문구: {', '.join(ex.required_keywords) or '(없음)'}\n\n영상 설명:\n{description[:2000]}")
 
 
@@ -172,9 +188,29 @@ def _draft_comment(self: "Extractor", video_title: str, description: str, ex: "E
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
     if not text:
         raise ValueError("빈 댓글 초안")
-    # 모델이 필수 문구를 빠뜨리면 덧붙인다.
+    return fit_comment(text, ex)
+
+
+def fit_comment(text: str, ex: "Extracted") -> str:
+    """모델이 놓친 필수 키워드와 최소 줄 수를 코드로 보장한다."""
+    text = text.strip()
     missing = [k for k in ex.required_keywords if k not in text]
-    return (text + " " + " ".join(missing)).strip() if missing else text
+    if missing:
+        text = f"{text}\n{' '.join(missing)}" if ex.comment_min_lines > 1 else f"{text} {' '.join(missing)}"
+    need = ex.comment_min_lines
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if need > 1 and len(lines) < need:
+        # 한 줄이면 문장 단위로, 그래도 모자라면 단어 절반 지점에서 나눈다.
+        pieces = [x for x in re.split(r"(?<=[.!?。])\s+", "\n".join(lines)) if x.strip()]
+        while len(pieces) < need:
+            longest = max(range(len(pieces)), key=lambda i: len(pieces[i]))
+            words = pieces[longest].split()
+            if len(words) < 2:
+                break
+            half = len(words) // 2
+            pieces[longest:longest + 1] = [" ".join(words[:half]), " ".join(words[half:])]
+        lines = pieces
+    return "\n".join(lines)
 
 
 Extractor.draft_comment = _draft_comment

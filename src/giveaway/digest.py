@@ -48,6 +48,8 @@ class YtEntry:
     entry_format: str = ""
     format_inferred: bool = False  # 시청자 댓글 패턴으로 추정한 양식(영상 말미 확인 필요)
     condition: str = ""            # 가입·구매 등 조건(제외 설정을 껐을 때만 표시됨)
+    comment_rule: str = ""         # 댓글 필수 키워드·최소 줄 수
+    membership: str = ""           # 채널 멤버십 필수/우대 여부 표시
 
 
 @dataclass
@@ -72,6 +74,10 @@ def format_youtube(entries: list[YtEntry]) -> str:
             lines.append("응모 방법: " + " → ".join(e.steps))
         if e.entry_format:
             lines.append(f"응모양식: {e.entry_format}" + (" (댓글 패턴으로 추정 — 영상 말미에서 확인!)" if e.format_inferred else ""))
+        if e.comment_rule:
+            lines.append(f"댓글 조건: {e.comment_rule}")
+        if e.membership:
+            lines.append(f"💳 멤버십: {e.membership}")
         if e.condition:
             lines.append(f"⚠️ 조건: {e.condition}")
         lines.append(f"링크: {e.url}")

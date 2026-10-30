@@ -28,6 +28,11 @@ def _notes(ex: Extracted) -> str:
     if manual:
         lines.append("📝 댓글 외에 직접 해야 할 것: " + (" → ".join(ex.entry_steps) if ex.entry_steps else ", ".join(manual))
                      + (f"\n   {ex.form_url}" if ex.form_url else ""))
+    if ex.membership != "none":
+        lines.append("💳 채널 멤버십(유료) " + ("가입이 필수 조건입니다" if ex.membership == "required" else "가입이 우대/권장 조건입니다")
+                     + " — 자동 처리하지 않으니 원하면 직접 가입하세요.")
+    if "알림" in " ".join(ex.entry_steps):
+        lines.append("🔔 알림 설정(종 아이콘)은 API로 못 해서 직접 해야 합니다.")
     if ex.macro_banned:
         lines.append("🚫 자동 응모 금지 문구가 있어 [게시] 버튼을 달지 않았습니다. 위 내용을 복사해 직접 작성하세요.")
     if {"subscribe", "like"} & set(ex.entry_methods) and not ex.macro_banned:

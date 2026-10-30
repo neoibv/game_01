@@ -1,0 +1,25 @@
+name: probe
+
+# 개발용 진단(임시). 작업 브랜치 push로만 실행된다.
+on:
+  push:
+    branches: [claude/confident-ptolemy-leaeu8]
+    paths: [.github/workflows/probe.yml, scripts/probe.py]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: python scripts/probe.py
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
