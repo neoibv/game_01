@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -197,3 +198,29 @@ def delete_event(conn: sqlite3.Connection, source_url: str) -> None:
 def meta_items(conn: sqlite3.Connection, prefix: str) -> list[tuple[str, str]]:
     return [(r["key"], r["value"]) for r in conn.execute(
         "SELECT key, value FROM meta WHERE key LIKE ? ORDER BY key", (prefix.replace("%", "") + "%",))]
+
+
+def blocked_topics(conn: sqlite3.Connection) -> list[str]:
+    return json.loads(get_meta(conn, "blocked_topics") or "[]")
+
+
+def set_blocked_topics(conn: sqlite3.Connection, words: list[str]) -> None:
+    set_meta(conn, "blocked_topics", json.dumps(list(dict.fromkeys(words)), ensure_ascii=False))
+
+
+def mark_entered(conn: sqlite3.Connection, event_id: int) -> bool:
+    """사용자가 직접 응모했다고 알린 이벤트를 응모 기록에 올린다. 이미 응모 상태면 False."""
+    row = get_event(conn, event_id)
+    if row is None or row["status"] == "entered":
+        return False
+    add_entry(conn, event_id, "manual", "")
+    update_event(conn, row["source_url"], status="entered")
+    return True
+
+
+def entered_events(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """응모한 이벤트(봇 게시·직접 응모 모두), 결과 발표일이 가까운 순(미정은 뒤)."""
+    return conn.execute(
+        "SELECT e.*, MIN(n.entered_at) AS entered_at FROM events e JOIN entries n ON n.event_id = e.id "
+        "WHERE e.status = 'entered' GROUP BY e.id "
+        "ORDER BY (e.announce_at IS NULL OR e.announce_at = ''), e.announce_at, e.id").fetchall()

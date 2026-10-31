@@ -1,6 +1,0 @@
-# 수집할 이벤트 모음 사이트. 목록은 로그인 없이 읽는다.
-# 접속 불가(Cloudflare 봇 차단/해외 IP 차단)로 제외한 곳: quasarzone, suto.co.kr, ppomppu
-sites:
-  - eventskr
-  - jupjup
-  - danawa

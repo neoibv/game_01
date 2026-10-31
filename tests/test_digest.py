@@ -38,16 +38,6 @@ def test_format_youtube_unknown_fields_and_order_by_score():
     assert "제품: 미상" in text and "이벤트 기한: 미상" in text
 
 
-def test_format_sites_groups_by_tier_and_skips_empty_tiers():
-    text = digest.format_sites([
-        digest.SiteEntry("jupjup", "스타벅스 쿠폰", "쿠폰", "2026-11-03", "https://u/1", "gift_travel", 50),
-        digest.SiteEntry("danawa", "그래픽카드 룰렛", "RTX", "", "https://u/2", "it", 40, manual=True),
-        digest.SiteEntry("eventskr", "SSD 이벤트", "SSD", "", "https://u/3", "it", 80)])
-    assert text.index("1순위") < text.index("3순위") and "2순위" not in text
-    assert text.index("SSD 이벤트") < text.index("그래픽카드 룰렛")  # 같은 순위에서는 점수순
-    assert "⚠️직접 응모" in text
-
-
 def test_split_message_respects_limit_and_keeps_all_text():
     blocks = [f"블록{i} " + "가" * 500 for i in range(20)]
     chunks = digest.split_message("\n\n".join(blocks), limit=1500)
@@ -303,3 +293,25 @@ def test_format_channel_event_asks_user_for_format_instead_of_drafting(tmp_path,
     request = tg.sent[0][1]
     assert "답장" in request and "지난 양식" in request
     assert conn.execute("SELECT status FROM events").fetchone()["status"] == "awaiting_format"
+
+
+def test_format_entered_shows_announce_dates_and_unknown():
+    from datetime import date
+    text = digest.format_entered([
+        {"title": "SSD 증정", "announce_at": "2026-11-05", "deadline": ""},
+        {"title": "모니터 추첨", "announce_at": "", "deadline": "2026-11-01"},
+        {"title": "지난 건", "announce_at": "2026-10-28", "deadline": ""}], date(2026, 10, 30))
+    assert "응모한 이벤트 (3건)" in text and "2026-11-05 (D-6)" in text
+    assert "미정 (마감 2026-11-01)" in text and "발표 지남" in text
+    assert digest.format_entered([], date(2026, 10, 30)) == ""
+
+
+def test_entered_footer_is_appended_to_notifications_and_blocked_topics_filter_events(tmp_path, respx_mock):
+    conn = db.connect(tmp_path / "t.db")
+    db.add_event(conn, source="youtube", source_url="https://y/old", title="이전 응모", host="h", matched=[], raw_text="")
+    db.update_event(conn, "https://y/old", announce_at="2999-01-01")
+    db.mark_entered(conn, db.event_id_by_url(conn, "https://y/old"))
+    assert "이전 응모" in cli._with_footer(conn, "본문") and "2999-01-01" in cli._with_footer(conn, "본문")
+    from giveaway.detect import blocked_topic
+    assert blocked_topic({"blocked_topics": ["헤드셋"]}, "무선 헤드셋 증정", "") == "헤드셋"
+    assert blocked_topic({"blocked_topics": ["헤드셋"]}, "이어폰 증정") == ""
